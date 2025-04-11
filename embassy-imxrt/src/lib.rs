@@ -18,6 +18,7 @@ compile_error!(
 pub(crate) mod fmt;
 
 pub mod clocks;
+pub mod crc;
 pub mod dma;
 pub mod flexcomm;
 pub mod gpio;
