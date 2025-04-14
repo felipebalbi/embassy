@@ -91,6 +91,7 @@ mec1727n_b0_sz = ["mec17xx-pac/mec1727n_b0_sz"]
 
 [dependencies]
 embassy-embedded-hal = { version = "0.5.0", path = "../embassy-embedded-hal" }
+embassy-espi-driver = { git = "https://github.com/felipebalbi/embassy-espi-rs" }
 embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
 embassy-hal-internal = { version = "0.3.0", path = "../embassy-hal-internal", features = ["cortex-m", "prio-bits-3"] }
 embassy-sync = { version = "0.7.2", path = "../embassy-sync" }
