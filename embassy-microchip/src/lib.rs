@@ -50,6 +50,7 @@ compile_error!(
 pub(crate) mod fmt;
 
 pub mod gpio;
+pub mod i2c;
 pub mod pwm;
 pub mod time_driver;
 
@@ -483,6 +484,12 @@ embassy_hal_internal::peripherals! {
     PWM9,
     PWM10,
     PWM11,
+
+    SMB0,
+    SMB1,
+    SMB2,
+    SMB3,
+    SMB4,
 }
 
 /// HAL configuration for Microchip.
