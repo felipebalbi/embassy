@@ -12,9 +12,6 @@ use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt::typelevel::{Binding, Interrupt};
 use crate::{interrupt, pac, peripherals};
 
-use pac::common::{Reg, RW};
-use pac::smb0::regs::Wctrl;
-
 /// I2c error abort reason
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -303,8 +300,6 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
     }
 
     async fn start_async(&mut self, address: u8, rw: bool, repeated: bool) -> Result<(), Error> {
-        let mut ctrl = Wctrl(0);
-
         if address >= 0x80 {
             return Err(Error::AddressOutOfRange(address));
         }
@@ -318,11 +313,11 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
         }
 
         if repeated {
-            ctrl.set_eso(true);
-            ctrl.set_sta(true);
-            ctrl.set_ack(true);
-            Self::write_ctrl(ctrl);
-
+            T::regs().wctrl().write(|w| {
+                w.set_eso(true);
+                w.set_sta(true);
+                w.set_ack(true);
+            });
             T::regs().i2cdata().write_value(address << 1 | u8::from(rw));
         } else {
             if rw {
@@ -333,11 +328,12 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
                 T::regs().i2cdata().write_value(address << 1 | 0);
             }
 
-            ctrl.set_pin(true);
-            ctrl.set_eso(true);
-            ctrl.set_sta(true);
-            ctrl.set_ack(true);
-            Self::write_ctrl(ctrl);
+            T::regs().wctrl().write(|w| {
+                w.set_pin(true);
+                w.set_eso(true);
+                w.set_sta(true);
+                w.set_ack(true);
+            });
 
             self.wait_for_completion_async().await?;
         }
@@ -376,9 +372,9 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
         let last = read.len() - 1;
         for (i, byte) in read.iter_mut().enumerate() {
             if i == last {
-                let mut ctrl = Wctrl(0);
-                ctrl.set_eso(true);
-                Self::write_ctrl(ctrl);
+                T::regs().wctrl().write(|w| {
+                    w.set_eso(true);
+                });
             }
 
             let b = self.read_byte_async().await?;
@@ -460,16 +456,6 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         i2c
     }
 
-    fn write_ctrl(ctrl: Wctrl) {
-        T::regs().wctrl().write_value(ctrl);
-
-        // WORKAROUND: If we try to initiate a transfer right after
-        // setting PIN bit, STATUS register will not update.
-        for _ in 0..8 {
-            let _ = T::regs().blkid().read();
-        }
-    }
-
     fn reset_reconfigure(&mut self) {
         let r = T::regs();
 
@@ -491,10 +477,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
                 w.set_flush_mrbuf(true);
             });
 
-            let mut ctrl = Wctrl(0);
-            ctrl.set_pin(true);
-            Self::write_ctrl(ctrl);
-
+            r.wctrl().write(|w| w.set_pin(true));
             r.own_addr().write(|w| {
                 w.set_addr1(addr1);
                 w.set_addr2(addr2);
@@ -583,9 +566,11 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
                 }
             }
 
-            ctrl.set_eso(true);
-            ctrl.set_ack(true);
-            Self::write_ctrl(ctrl);
+            r.wctrl().write(|w| {
+                w.set_pin(true);
+                w.set_eso(true);
+                w.set_ack(true);
+            });
 
             r.cfg().modify(|w| w.set_en(true));
         });
@@ -607,8 +592,6 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
     }
 
     fn start(address: u8, rw: bool, repeated: bool) -> Result<(), Error> {
-        let mut ctrl = Wctrl(0);
-
         if address >= 0x80 {
             return Err(Error::AddressOutOfRange(address));
         }
@@ -622,11 +605,11 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         }
 
         if repeated {
-            ctrl.set_eso(true);
-            ctrl.set_sta(true);
-            ctrl.set_ack(true);
-            Self::write_ctrl(ctrl);
-
+            T::regs().wctrl().write(|w| {
+                w.set_eso(true);
+                w.set_sta(true);
+                w.set_ack(true);
+            });
             T::regs().i2cdata().write_value(address << 1 | u8::from(rw));
         } else {
             if rw {
@@ -637,30 +620,38 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
                 T::regs().i2cdata().write_value(address << 1 | 0);
             }
 
-            ctrl.set_pin(true);
-            ctrl.set_eso(true);
-            ctrl.set_sta(true);
-            ctrl.set_ack(true);
-            Self::write_ctrl(ctrl);
+            T::regs().wctrl().write(|w| {
+                w.set_pin(true);
+                w.set_eso(true);
+                w.set_sta(true);
+                w.set_ack(true);
+            });
         }
 
         Ok(())
     }
 
     fn stop() {
-        let mut ctrl = Wctrl(0);
-        ctrl.set_pin(true);
-        ctrl.set_eso(true);
-        ctrl.set_sto(true);
-        ctrl.set_sta(false);
-        ctrl.set_ack(true);
-        Self::write_ctrl(ctrl);
+        T::regs().wctrl().write(|w| {
+            w.set_pin(true);
+            w.set_eso(true);
+            w.set_sto(true);
+            w.set_sta(false);
+            w.set_ack(true);
+        });
     }
 
     fn check_status() -> Result<(), Error> {
-        while T::regs().rsts().read().pin() {}
+        while T::regs().rsts().read().pin() {
+            cortex_m::asm::delay(500_000);
+
+            let status = T::regs().rsts().read();
+            let compl = T::regs().compl().read();
+            defmt::debug!("STATUS: {} COMPL {}", status, compl);
+        }
 
         let status = T::regs().rsts().read();
+        defmt::debug!("STATUS: {}", status);
 
         if status.lrb_ad0() {
             Self::stop();
@@ -688,16 +679,20 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
     fn read_byte(last: bool) -> Result<u8, Error> {
         if !last {
+            defmt::debug!("R: CHECK STATUS not last");
             Self::check_status()?;
         } else {
-            let mut ctrl = Wctrl(0);
-            ctrl.set_eso(true);
-            Self::write_ctrl(ctrl);
+            defmt::debug!("R: Update WCTRL for last");
+            T::regs().wctrl().write(|w| {
+                w.set_eso(true);
+            });
         }
 
+        defmt::debug!("R: Read data register");
         let byte = T::regs().i2cdata().read();
 
         if last {
+            defmt::debug!("R: CHECK STATUS for last");
             Self::check_status()?;
         }
 
@@ -705,7 +700,9 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
     }
 
     fn write_byte(byte: u8) -> Result<(), Error> {
+        defmt::debug!("W: CHECK STATUS");
         Self::check_status()?;
+        defmt::debug!("W: write to data register");
         T::regs().i2cdata().write_value(byte);
         Ok(())
     }
@@ -721,17 +718,21 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             return Err(Error::InvalidReadBufferLength);
         }
 
+        defmt::debug!("R: START");
         Self::start(address, true, repeated)?;
 
         // First byte in the FIFO is the slave address. Ignore it.
-        let _addr = Self::read_byte(false)?;
+        let addr = Self::read_byte(false)?;
 
         let last = read.len() - 1;
         for (i, byte) in read.iter_mut().enumerate() {
             *byte = Self::read_byte(i == last)?;
         }
 
+        defmt::debug!("R: {:02x}", read);
+
         if send_stop {
+            defmt::debug!("R: STOP");
             Self::stop();
         }
 
@@ -743,13 +744,16 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             return Err(Error::InvalidWriteBufferLength);
         }
 
+        defmt::debug!("W: START");
         Self::start(address, false, false)?;
 
+        defmt::debug!("W: {:02x}", write);
         for byte in write.iter() {
             Self::write_byte(*byte)?;
         }
 
         if send_stop {
+            defmt::debug!("W: STOP");
             Self::stop();
         }
 
@@ -768,7 +772,9 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
     /// Write to address from write and read from address into read blocking caller until done.
     pub fn blocking_write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Error> {
+        defmt::debug!("WRITE SECTION");
         self.write_blocking_internal(address, write, false)?;
+        defmt::debug!("READ SECTION");
         self.read_blocking_internal(address, read, true, true)
     }
 }
