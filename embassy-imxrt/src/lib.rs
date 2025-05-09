@@ -20,6 +20,7 @@ pub(crate) mod fmt;
 pub mod clocks;
 pub mod gpio;
 pub mod iopctl;
+pub mod pdm;
 
 #[cfg(feature = "_time-driver")]
 pub mod time_driver;
