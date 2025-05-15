@@ -722,7 +722,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         Self::start(address, true, repeated)?;
 
         // First byte in the FIFO is the slave address. Ignore it.
-        let addr = Self::read_byte(false)?;
+        let _ = Self::read_byte(false)?;
 
         let last = read.len() - 1;
         for (i, byte) in read.iter_mut().enumerate() {
