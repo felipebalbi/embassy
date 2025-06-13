@@ -638,16 +638,9 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
     }
 
     fn check_status() -> Result<(), Error> {
-        while T::regs().rsts().read().pin() {
-            cortex_m::asm::delay(500_000);
-
-            let status = T::regs().rsts().read();
-            let compl = T::regs().compl().read();
-            defmt::debug!("STATUS: {} COMPL {}", status, compl);
-        }
+        while T::regs().rsts().read().pin() {}
 
         let status = T::regs().rsts().read();
-        defmt::debug!("STATUS: {}", status);
 
         if status.lrb_ad0() {
             Self::stop();
@@ -675,20 +668,16 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
     fn read_byte(last: bool) -> Result<u8, Error> {
         if !last {
-            defmt::debug!("R: CHECK STATUS not last");
             Self::check_status()?;
         } else {
-            defmt::debug!("R: Update WCTRL for last");
             T::regs().wctrl().write(|w| {
                 w.set_eso(true);
             });
         }
 
-        defmt::debug!("R: Read data register");
         let byte = T::regs().i2cdata().read();
 
         if last {
-            defmt::debug!("R: CHECK STATUS for last");
             Self::check_status()?;
         }
 
@@ -696,9 +685,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
     }
 
     fn write_byte(byte: u8) -> Result<(), Error> {
-        defmt::debug!("W: CHECK STATUS");
         Self::check_status()?;
-        defmt::debug!("W: write to data register");
         T::regs().i2cdata().write_value(byte);
         Ok(())
     }
@@ -714,7 +701,6 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             return Err(Error::InvalidReadBufferLength);
         }
 
-        defmt::debug!("R: START");
         Self::start(address, true, repeated)?;
 
         // First byte in the FIFO is the slave address. Ignore it.
@@ -725,10 +711,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             *byte = Self::read_byte(i == last)?;
         }
 
-        defmt::debug!("R: {:02x}", read);
-
         if send_stop {
-            defmt::debug!("R: STOP");
             Self::stop();
         }
 
@@ -740,16 +723,13 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             return Err(Error::InvalidWriteBufferLength);
         }
 
-        defmt::debug!("W: START");
         Self::start(address, false, false)?;
 
-        defmt::debug!("W: {:02x}", write);
         for byte in write.iter() {
             Self::write_byte(*byte)?;
         }
 
         if send_stop {
-            defmt::debug!("W: STOP");
             Self::stop();
         }
 
@@ -768,9 +748,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
     /// Write to address from write and read from address into read blocking caller until done.
     pub fn blocking_write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Error> {
-        defmt::debug!("WRITE SECTION");
         self.write_blocking_internal(address, write, false)?;
-        defmt::debug!("READ SECTION");
         self.read_blocking_internal(address, read, true, true)
     }
 }
@@ -1027,6 +1005,7 @@ macro_rules! impl_pin {
 		    critical_section::with(|_| {
 			self.regs().ctrl1.modify(|w| {
 			    w.set_out_buff_type(crate::pac::BufferType::OPEN_DRAIN);
+                            w.set_inp_dis(false);
 			    w.set_alt_data(true);
 			    w.set_mux_ctrl(crate::pac::Function::$mux);
 			})
@@ -1057,8 +1036,8 @@ impl_pin!(
     GPIO145, F1,
     GPIO147, F1,
     GPIO152, F3,
-    GPIO154, F1
-    // GPIO231, F1 missing
+    GPIO154, F1,
+    GPIO231, F1
 );
 
 #[rustfmt::skip]
@@ -1081,8 +1060,8 @@ impl_pin!(
     GPIO144, F4,
     GPIO146, F1,
     GPIO150, F1,
-    GPIO155, F1
-    // GPIO230, F1 missing
+    GPIO155, F1,
+    GPIO230, F1
 );
 
 trait SealedValidI2cConfig {
@@ -1161,7 +1140,7 @@ impl_config!(GPIO13, GPIO12, 7);
 impl_config!(GPIO24, GPIO152, 7);
 
 // I2C08
-// impl_config!(GPIO230, GPIO231, 8); MISSING
+impl_config!(GPIO230, GPIO231, 8);
 
 // I2C09
 impl_config!(GPIO146, GPIO145, 9);
