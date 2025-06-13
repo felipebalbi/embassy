@@ -6,7 +6,6 @@ use core::pin::Pin as FuturePin;
 use core::task::{Context, Poll};
 
 use cortex_m::interrupt::InterruptNumber;
-
 use embassy_hal_internal::{impl_peripheral, Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 
@@ -1130,6 +1129,9 @@ impl_pin!(GPIO224, 22, 4, 4, 20, src12, en_set12, result12, en_clr12);
 impl_pin!(GPIO225, 22, 5, 4, 21, src12, en_set12, result12, en_clr12);
 impl_pin!(GPIO226, 22, 6, 4, 22, src12, en_set12, result12, en_clr12);
 impl_pin!(GPIO227, 22, 7, 4, 23, src12, en_set12, result12, en_clr12);
+
+impl_pin!(GPIO230, 23, 0, 4, 23, src11, en_set11, result11, en_clr11);
+impl_pin!(GPIO231, 23, 0, 4, 23, src11, en_set11, result11, en_clr11);
 
 impl_pin!(GPIO240, 24, 0, 17, 0, src26, en_set26, result26, en_clr26);
 impl_pin!(GPIO241, 24, 1, 17, 1, src26, en_set26, result26, en_clr26);

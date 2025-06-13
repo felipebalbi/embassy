@@ -56,7 +56,6 @@ pub mod time_driver;
 
 // Reexports
 pub use embassy_hal_internal::{Peri, PeripheralType};
-
 #[cfg(feature = "unstable-pac")]
 pub use mec17xx_pac as pac;
 #[cfg(not(feature = "unstable-pac"))]
@@ -450,7 +449,9 @@ embassy_hal_internal::peripherals! {
     GPIO226,
     GPIO227,
 
-    // Port 23 doesn't exist
+    // Port 23
+    GPIO230,
+    GPIO231,
 
     // Port 24
     GPIO240,
