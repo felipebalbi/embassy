@@ -464,11 +464,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
         critical_section::with(|_| {
             // Reset the controller first.
-            r.cfg().write(|w| w.set_rst(true));
-            // Reset must remain set for at least 1 period of the 16MHz
-            // clock. Fastest CPU clock is 48MHz. If we delay for a
-            // minimum of 10 cycles of the CPU clock, we're good.
-            r.cfg().write(|w| w.set_rst(false));
+            T::reset();
 
             r.cfg().write(|w| {
                 w.set_flush_sxbuf(true);
@@ -923,6 +919,7 @@ trait SealedInstance {
     fn regs() -> smb0::Smb0;
     fn waker() -> &'static AtomicWaker;
     fn irq_bit() -> usize;
+    fn reset();
 }
 
 trait SealedMode {}
@@ -954,8 +951,12 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
     type Interrupt: interrupt::typelevel::Interrupt;
 }
 
+// Ideally, these should be part of a dedicated PCR driver
+const LOCK: u32 = 0xa638_2d4d;
+const UNLOCK: u32 = 0xa638_2d4c;
+
 macro_rules! impl_instance {
-    ($peri:ident, $bit:expr, $irq:ident) => {
+    ($peri:ident, $bit:expr, $irq:ident, $reset:expr) => {
         impl SealedInstance for peripherals::$peri {
             #[inline(always)]
             fn regs() -> smb0::Smb0 {
@@ -972,6 +973,17 @@ macro_rules! impl_instance {
             fn irq_bit() -> usize {
                 $bit
             }
+
+            #[inline(always)]
+            fn reset() {
+                fn internal_reset(f: impl FnOnce(pac::pcr::Pcr)) {
+                    pac::PCR.lock_reg().write(|w| w.set_pcr_rst_en_lock(UNLOCK));
+                    f(pac::PCR);
+                    pac::PCR.lock_reg().write(|w| w.set_pcr_rst_en_lock(LOCK));
+                }
+
+                internal_reset($reset);
+            }
         }
 
         impl Instance for peripherals::$peri {
@@ -980,11 +992,21 @@ macro_rules! impl_instance {
     };
 }
 
-impl_instance!(SMB0, 0, I2CSMB0);
-impl_instance!(SMB1, 1, I2CSMB1);
-impl_instance!(SMB2, 2, I2CSMB2);
-impl_instance!(SMB3, 3, I2CSMB3);
-impl_instance!(SMB4, 4, I2CSMB4);
+impl_instance!(SMB0, 0, I2CSMB0, |pcr| pcr
+    .rst_en_1()
+    .write(|w| w.set_smb0_rst_en(true)));
+impl_instance!(SMB1, 1, I2CSMB1, |pcr| pcr
+    .rst_en_3()
+    .write(|w| w.set_smb1_rst_en(true)));
+impl_instance!(SMB2, 2, I2CSMB2, |pcr| pcr
+    .rst_en_3()
+    .write(|w| w.set_smb2_rst_en(true)));
+impl_instance!(SMB3, 3, I2CSMB3, |pcr| pcr
+    .rst_en_3()
+    .write(|w| w.set_smb3_rst_en(true)));
+impl_instance!(SMB4, 4, I2CSMB4, |pcr| pcr
+    .rst_en_3()
+    .write(|w| w.set_smb_4_rst_en(true)));
 
 /// SDA pin.
 pub trait SdaPin: crate::gpio::Pin {
