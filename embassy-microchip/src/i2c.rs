@@ -137,6 +137,16 @@ impl Default for Config {
     }
 }
 
+macro_rules! write_register_with_delay {
+    ($reg_path:expr, |$w:ident| $body:block) => {
+        {
+            $reg_path.write(|$w| $body);
+            // TODO - empirically determined delay
+            cortex_m::asm::delay(20_000);
+        }
+    };
+}
+
 /// I2C driver.
 pub struct I2c<'d, T: Instance, M: Mode> {
     _peri: Peri<'d, T>,
@@ -313,7 +323,7 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
         }
 
         if repeated {
-            T::regs().wctrl().write(|w| {
+            write_register_with_delay!(T::regs().wctrl(), |w| {
                 w.set_eso(true);
                 w.set_sta(true);
                 w.set_ack(true);
@@ -328,7 +338,7 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
                 T::regs().i2cdata().write_value(address << 1 | 0);
             }
 
-            T::regs().wctrl().write(|w| {
+            write_register_with_delay!(T::regs().wctrl(), |w| {
                 w.set_pin(true);
                 w.set_eso(true);
                 w.set_sta(true);
@@ -372,7 +382,7 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
         let last = read.len() - 1;
         for (i, byte) in read.iter_mut().enumerate() {
             if i == last {
-                T::regs().wctrl().write(|w| {
+                write_register_with_delay!(T::regs().wctrl(), |w| {
                     w.set_eso(true);
                 });
             }
@@ -601,7 +611,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         }
 
         if repeated {
-            T::regs().wctrl().write(|w| {
+            write_register_with_delay!(T::regs().wctrl(), |w| {
                 w.set_eso(true);
                 w.set_sta(true);
                 w.set_ack(true);
@@ -616,7 +626,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
                 T::regs().i2cdata().write_value(address << 1 | 0);
             }
 
-            T::regs().wctrl().write(|w| {
+            write_register_with_delay!(T::regs().wctrl(), |w| {
                 w.set_pin(true);
                 w.set_eso(true);
                 w.set_sta(true);
@@ -628,7 +638,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
     }
 
     fn stop() {
-        T::regs().wctrl().write(|w| {
+        write_register_with_delay!(T::regs().wctrl(), |w| {
             w.set_pin(true);
             w.set_eso(true);
             w.set_sto(true);
@@ -670,7 +680,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         if !last {
             Self::check_status()?;
         } else {
-            T::regs().wctrl().write(|w| {
+            write_register_with_delay!(T::regs().wctrl(), |w| {
                 w.set_eso(true);
             });
         }
@@ -738,17 +748,27 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
     /// Read from address into read blocking caller until done.
     pub fn blocking_read(&mut self, address: u8, read: &mut [u8]) -> Result<(), Error> {
-        self.read_blocking_internal(address, read, false, true)
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
+        let retval = self.read_blocking_internal(address, read, false, true);
+        retval
     }
 
     /// Write to address from write blocking caller until done.
     pub fn blocking_write(&mut self, address: u8, write: &[u8]) -> Result<(), Error> {
-        self.write_blocking_internal(address, write, true)
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
+        let retval = self.write_blocking_internal(address, write, true);
+        retval
     }
 
     /// Write to address from write and read from address into read blocking caller until done.
     pub fn blocking_write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Error> {
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
         self.write_blocking_internal(address, write, false)?;
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
         self.read_blocking_internal(address, read, true, true)
     }
 }
