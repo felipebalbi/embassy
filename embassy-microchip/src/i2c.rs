@@ -748,16 +748,24 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
     /// Read from address into read blocking caller until done.
     pub fn blocking_read(&mut self, address: u8, read: &mut [u8]) -> Result<(), Error> {
-        self.read_blocking_internal(address, read, false, true)
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
+        let retval = self.read_blocking_internal(address, read, false, true);
+        retval
     }
 
     /// Write to address from write blocking caller until done.
     pub fn blocking_write(&mut self, address: u8, write: &[u8]) -> Result<(), Error> {
-        self.write_blocking_internal(address, write, true)
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
+        let retval = self.write_blocking_internal(address, write, true);
+        retval
     }
 
     /// Write to address from write and read from address into read blocking caller until done.
     pub fn blocking_write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Error> {
+        // TODO - empirically determined delay
+        cortex_m::asm::delay(20_000);
         self.write_blocking_internal(address, write, false)?;
         // TODO - empirically determined delay
         cortex_m::asm::delay(20_000);
