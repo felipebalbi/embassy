@@ -165,13 +165,31 @@ impl<'d> Input<'d> {
     /// Wait until the pin is high. If it is already high, return immediately.
     #[inline]
     pub async fn wait_for_high(&mut self) {
-        self.pin.wait_for_high().await;
+        // TODO - wait_for_high() isn't seeing the pin state change
+        //self.pin.wait_for_high().await;
+        loop {
+            // Wait for the pin to be high, then return.
+            if self.pin.is_high() {
+                return;
+            }
+            // If the pin is not high, yield to allow other tasks to run.
+            //embassy_executor::yield_now().await;
+        }
     }
 
     /// Wait until the pin is low. If it is already low, return immediately.
     #[inline]
     pub async fn wait_for_low(&mut self) {
-        self.pin.wait_for_low().await;
+        // TODO - wait_for_high() isn't seeing the pin state change
+        //self.pin.wait_for_low().await;
+        loop {
+            // Wait for the pin to be low, then return.
+            if self.pin.is_low() {
+                return;
+            }
+            // If the pin is not low, yield to allow other tasks to run.
+            //embassy_executor::yield_now().await;
+        }
     }
 
     /// Wait for the pin to undergo a transition from low to high.
