@@ -70,37 +70,15 @@ pub(crate) unsafe fn init() {
 /// DMA read.
 ///
 /// SAFETY: Slice must point to a valid location reachable by DMA.
-pub unsafe fn read<'a, C: Channel, W: Word>(ch: Peri<'a, C>, from: *const W, to: *mut [W]) -> Transfer<'a, C> {
-    let count = (to.len().div_ceil(W::size() as usize) - 1) as isize;
-
-    copy_inner(
-        ch,
-        from as *const u32,
-        (to as *mut u32).byte_offset(count * W::size()),
-        W::width(),
-        count,
-        false,
-        true,
-        true,
-    )
+pub unsafe fn read<'a, C: Channel, W: Word>(ch: Peri<'a, C>, from: &[W], to: &mut [W]) -> Transfer<'a, C> {
+    copy_inner(ch, from, to, false, true, true)
 }
 
 /// DMA write.
 ///
 /// SAFETY: Slice must point to a valid location reachable by DMA.
-pub unsafe fn write<'a, C: Channel, W: Word>(ch: Peri<'a, C>, from: *const [W], to: *mut W) -> Transfer<'a, C> {
-    let count = (from.len().div_ceil(W::size() as usize) - 1) as isize;
-
-    copy_inner(
-        ch,
-        (from as *const u32).byte_offset(count * W::size()),
-        to as *mut u32,
-        W::width(),
-        count,
-        true,
-        false,
-        true,
-    )
+pub unsafe fn write<'a, C: Channel, W: Word>(ch: Peri<'a, C>, from: &[W], to: &mut [W]) -> Transfer<'a, C> {
+    copy_inner(ch, from, to, true, false, true)
 }
 
 /// DMA copy between slices.
@@ -111,35 +89,35 @@ pub unsafe fn copy<'a, C: Channel, W: Word>(ch: Peri<'a, C>, from: &[W], to: &mu
     let to_len = to.len();
     assert_eq!(from_len, to_len);
 
-    let count = (from_len.div_ceil(W::size() as usize) - 1) as isize;
-
-    copy_inner(
-        ch,
-        from.as_ptr().byte_offset(count * W::size()) as *const u32,
-        to.as_mut_ptr().byte_offset(count * W::size()) as *mut u32,
-        W::width(),
-        count,
-        true,
-        true,
-        false,
-    )
+    copy_inner(ch, from, to, true, true, false)
 }
 
-fn copy_inner<'a, C: Channel>(
+unsafe fn copy_inner<'a, C: Channel, W: Word>(
     ch: Peri<'a, C>,
-    from: *const u32,
-    to: *mut u32,
-    width: Width,
-    count: isize,
+    from: &[W],
+    to: &mut [W],
     incr_read: bool,
     incr_write: bool,
     periph: bool,
 ) -> Transfer<'a, C> {
+    let count = (from.len().div_ceil(W::size() as usize) - 1) as isize;
+
+    let src = if incr_read {
+        (from as *const _ as *const u32).byte_offset(count * W::size())
+    } else {
+        from as *const _ as *const u32
+    };
+    let dst = if incr_write {
+        (to as *mut _ as *mut u32).byte_offset(count * W::size())
+    } else {
+        to as *mut _ as *mut u32
+    };
+
     let p = ch.regs();
 
     unsafe {
-        DESCRIPTORS.descs[ch.number() as usize].src = from as u32;
-        DESCRIPTORS.descs[ch.number() as usize].dest = to as u32;
+        DESCRIPTORS.descs[ch.number() as usize].src = src as u32;
+        DESCRIPTORS.descs[ch.number() as usize].dest = dst as u32;
     }
 
     compiler_fence(Ordering::SeqCst);
@@ -171,7 +149,7 @@ fn copy_inner<'a, C: Channel>(
             .setinta()
             .set_bit()
             .width()
-            .variant(width)
+            .variant(W::width())
             .srcinc()
             .variant(match incr_read {
                 false => Srcinc::NoIncrement,

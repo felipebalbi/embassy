@@ -602,7 +602,13 @@ impl<'a> UartTx<'a, Async> {
             regs.fifocfg().modify(|_, w| w.dmatx().enabled());
 
             let ch = self.tx_dma.as_mut().unwrap().reborrow();
-            let transfer = unsafe { dma::write(ch, chunk, regs.fifowr().as_ptr() as *mut u8) };
+            let transfer = unsafe {
+                dma::write(
+                    ch,
+                    chunk,
+                    core::slice::from_raw_parts_mut(regs.fifowr().as_ptr() as *mut u8, 1),
+                )
+            };
 
             let res = select(
                 transfer,
@@ -730,7 +736,13 @@ impl<'a> UartRx<'a, Async> {
             regs.fifocfg().modify(|_, w| w.dmarx().enabled());
 
             let ch = self.rx_dma.as_mut().unwrap().reborrow();
-            let transfer = unsafe { dma::read(ch, regs.fiford().as_ptr() as *const u8, chunk) };
+            let transfer = unsafe {
+                dma::read(
+                    ch,
+                    core::slice::from_raw_parts(regs.fiford().as_ptr() as *const u8, 1),
+                    chunk,
+                )
+            };
 
             let res = select(
                 transfer,
