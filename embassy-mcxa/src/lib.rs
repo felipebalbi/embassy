@@ -19,6 +19,7 @@ pub mod lpuart;
 pub mod ostimer;
 pub mod reset_reason;
 pub mod rtc;
+pub mod tamper;
 pub mod trng;
 pub mod wwdt;
 
