@@ -29,7 +29,6 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send + Gate<Mrcc
     /// Clock instance
     const CLOCK_INSTANCE: crate::clocks::periph_helpers::Lpi2cInstance;
 }
-
 struct Info {
     regs: *const pac::lpi2c0::RegisterBlock,
     wait_cell: WaitCell,
