@@ -284,6 +284,16 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.info.regs().mfsr().read().rxcount() == 0
     }
 
+    /// Checks whether an error condition is flagged.
+    fn is_error_flagged(&self) -> bool {
+        let status = self.info.regs().msr().read();
+
+        status.ndf() == Ndf::INT_YES
+            || status.alf() == Alf::INT_YES
+            || status.fef() == MsrFef::INT_YES
+            || status.pltf() == Pltf::INT_YES
+    }
+
     /// Reads and parses the controller status producing an
     /// appropriate `Result<(), Error>` variant.
     fn status(&self) -> Result<(), IOError> {
@@ -300,17 +310,6 @@ impl<'d, M: Mode> I2c<'d, M> {
         });
 
         if msr.ndf() == Ndf::INT_YES {
-            // According to the Reference Manual, section 40.7.1.5
-            // Controller Status (MSR), the controller will
-            // automatically send a STOP condition if
-            // `MCFGR1[AUTOSTOP]` is enabled or if the transmit FIFO
-            // is *not* empty.
-            //
-            // If neither of those conditions is true, we will send a
-            // STOP ourselves.
-            if !self.info.regs().mcfgr1().read().autostop() && self.is_tx_fifo_empty() {
-                self.stop()?;
-            }
             Err(IOError::AddressNack)
         } else if msr.alf() == Alf::INT_YES {
             Err(IOError::ArbitrationLoss)
@@ -341,6 +340,28 @@ impl<'d, M: Mode> I2c<'d, M> {
         });
     }
 
+    fn remediation(&self) {
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Issuing stop");
+
+        // if the FIFO is not empty, drop its contents.
+        if !self.is_tx_fifo_empty() {
+            self.reset_fifos();
+        }
+
+        // According to the Reference Manual, section 40.7.1.5
+        // Controller Status (MSR), the controller will
+        // automatically send a STOP condition if
+        // `MCFGR1[AUTOSTOP]` is enabled or if the transmit FIFO
+        // is *not* empty.
+        //
+        // If neither of those conditions is true, we will send a
+        // STOP ourselves.
+        if !self.info.regs().mcfgr1().read().autostop() && self.is_tx_fifo_empty() {
+            let _ = self.stop();
+        }
+    }
+
     /// Prepares an appropriate Start condition on bus by issuing a
     /// `Start` command together with the device address and R/w bit.
     ///
@@ -360,9 +381,18 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         // Wait for TxFIFO to be drained
         while !self.is_tx_fifo_empty() {}
+        // G 1274
+        // B 1273
+        cortex_m::asm::delay(1274);
 
         // Check controller status
-        self.status()
+        match self.status() {
+            Err(IOError::AddressNack) => {
+                self.remediation();
+                Err(IOError::AddressNack)
+            }
+            other => other,
+        }
     }
 
     /// Prepares a Stop condition on the bus.
@@ -481,19 +511,6 @@ impl<'d> I2c<'d, Async> {
         Self::new_inner(peri, scl, sda, config)
     }
 
-    fn remediation(&self) {
-        #[cfg(feature = "defmt")]
-        defmt::trace!("Future dropped, issuing stop",);
-
-        // if the FIFO is not empty, drop its contents.
-        if !self.is_tx_fifo_empty() {
-            self.reset_fifos();
-        }
-
-        // send a stop command
-        let _ = self.stop();
-    }
-
     fn enable_rx_ints(&self) {
         self.info.regs().mier().write(|w| {
             w.set_rdie(true);
@@ -528,8 +545,10 @@ impl<'d> I2c<'d, Async> {
             .wait_for(|| {
                 // enable interrupts
                 self.enable_tx_ints();
-                // if the command FIFO is empty, we're done sending start
-                self.is_tx_fifo_empty()
+                // if the command FIFO is empty or we have an error, we're done sending start
+                let status = self.info.regs().msr().read();
+
+                self.is_tx_fifo_empty() || self.is_error_flagged()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -546,8 +565,7 @@ impl<'d> I2c<'d, Async> {
             .wait_for(|| {
                 // enable interrupts
                 self.enable_tx_ints();
-                // if the command FIFO is empty, we're done sending stop
-                self.is_tx_fifo_empty()
+                self.is_tx_fifo_empty() || self.is_error_flagged()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -574,8 +592,8 @@ impl<'d> I2c<'d, Async> {
                 .wait_for(|| {
                     // enable interrupts
                     self.enable_tx_ints();
-                    // if the command FIFO is empty, we're done sending start
-                    self.is_tx_fifo_empty()
+                    // if the command FIFO is empty, we're done receiving data
+                    self.is_tx_fifo_empty() || self.is_error_flagged()
                 })
                 .await
                 .map_err(|_| IOError::Other)?;
@@ -587,7 +605,7 @@ impl<'d> I2c<'d, Async> {
                         // enable interrupts
                         self.enable_rx_ints();
                         // if the rx FIFO is not empty, we need to read a byte
-                        !self.is_rx_fifo_empty()
+                        !self.is_rx_fifo_empty() || self.is_error_flagged()
                     })
                     .await
                     .map_err(|_| IOError::ReadFail)?;
@@ -636,7 +654,7 @@ impl<'d> I2c<'d, Async> {
                     // initiate transmit
                     self.send_cmd(Cmd::TRANSMIT, *byte);
                     // if the tx FIFO is empty, we're done transmiting
-                    self.is_tx_fifo_empty()
+                    self.is_tx_fifo_empty() || self.is_error_flagged()
                 })
                 .await
                 .map_err(|_| IOError::WriteFail)?;
