@@ -7,6 +7,8 @@
 //!
 //! See the docs of [`SPConfHelper`] for more details.
 
+use nxp_pac::mrcc::vals::LptmrClkselMux;
+
 use super::{ClockError, Clocks, PoweredClock, WakeGuard};
 use crate::clocks::config::VddLevel;
 use crate::pac::mrcc::vals::{
@@ -369,7 +371,7 @@ impl SPConfHelper for Lpi2cConfig {
         };
         let div = self.div.into_divisor();
         let expected = freq / div;
-        // 22.3.2 peripheral clock max functional clock limits
+        // 21.3.2 peripheral clock max functional clock limits
         let fmax = match clocks.active_power {
             VddLevel::MidDriveMode => 25_000_000,
             VddLevel::OverDriveMode => 60_000_000,
@@ -498,7 +500,7 @@ impl SPConfHelper for LpuartConfig {
         // Check clock speed is reasonable
         let div = self.div.into_divisor();
         let expected = freq / div;
-        // 22.3.2 peripheral clock max functional clock limits
+        // 21.3.2 peripheral clock max functional clock limits
         let fmax = match clocks.active_power {
             VddLevel::MidDriveMode => 45_000_000,
             VddLevel::OverDriveMode => 180_000_000,
@@ -618,7 +620,7 @@ impl SPConfHelper for CTimerConfig {
         let div = self.div.into_divisor();
         let expected = freq / div;
 
-        // 22.3.2 peripheral clock max functional clock limits
+        // 21.3.2 peripheral clock max functional clock limits
         let fmax = match clocks.active_power {
             VddLevel::MidDriveMode => 25_000_000,
             VddLevel::OverDriveMode => 60_000_000,
@@ -661,7 +663,7 @@ pub struct OsTimerConfig {
 impl SPConfHelper for OsTimerConfig {
     fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
         let mrcc0 = pac::MRCC0;
-        // NOTE: complies with 22.3.2 peripheral clock max functional clock limits
+        // NOTE: complies with 21.3.2 peripheral clock max functional clock limits
         // which is 1MHz, and we can only select 1mhz/16khz.
         Ok(match self.source {
             OstimerClockSel::Clk16kVddCore => {
@@ -691,6 +693,94 @@ impl SPConfHelper for OsTimerConfig {
                 PreEnableParts::empty()
             }
         })
+    }
+}
+
+//
+// LpTmr
+//
+
+/// Selectable clocks for the LpTmr peripheral
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LpTmrClockSel {
+    /// FRO12M/FRO_LF/SIRC clock source, passed through divider
+    /// "fro_lf_div"
+    FroLfDiv,
+    /// FRO180M/FRO_HF/FIRC clock source, passed through divider
+    /// "fro_hf_div"
+    FroHfDiv,
+    /// SOSC/XTAL/EXTAL clock source
+    #[cfg(not(feature = "sosc-as-gpio"))]
+    ClkIn,
+    /// clk_1m/FRO_LF divided by 12
+    Clk1M,
+    /// Internal PLL output, with configurable divisor
+    Pll1ClkDiv,
+    /// Disabled
+    None,
+}
+
+/// Top level configuration for the `LpTmr` peripheral
+pub struct LpTmrConfig {
+    /// Power state required for this peripheral
+    pub power: PoweredClock,
+    /// Selected clock source for this peripheral
+    pub source: LpTmrClockSel,
+    /// Clock divisor
+    pub div: Div4,
+}
+
+impl SPConfHelper for LpTmrConfig {
+    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+        // Always 22.5MHz maximum frequency.
+        const LPTMR_FCLK_MAX: u32 = 22_500_000;
+
+        let mrcc0 = pac::MRCC0;
+        // NOTE: complies with 21.3.2 peripheral clock max functional
+        // clock limits which is 22.5MHz.
+        let (clkdiv, clksel) = (mrcc0.mrcc_lptmr0_clkdiv(), mrcc0.mrcc_lptmr0_clksel());
+
+        let (freq, variant) = match self.source {
+            LpTmrClockSel::FroLfDiv => {
+                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
+                (freq, LptmrClkselMux::CLKROOT_FUNC_0)
+            }
+            LpTmrClockSel::FroHfDiv => {
+                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
+                (freq, LptmrClkselMux::CLKROOT_FUNC_2)
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            LpTmrClockSel::ClkIn => {
+                let freq = clocks.ensure_clk_in_active(&self.power)?;
+                (freq, LptmrClkselMux::CLKROOT_FUNC_3)
+            }
+            LpTmrClockSel::Clk1M => {
+                let freq = clocks.ensure_clk_1m_active(&self.power)?;
+                (freq, LptmrClkselMux::CLKROOT_FUNC_5)
+            }
+            LpTmrClockSel::Pll1ClkDiv => {
+                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
+                (freq, LptmrClkselMux::CLKROOT_FUNC_6)
+            }
+            LpTmrClockSel::None => {
+                // no ClkrootFunc7, just write manually for now
+                clksel.write(|w| w.0 = 0b111);
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::OFF);
+                    w.set_halt(ClkdivHalt::OFF);
+                });
+                return Ok(PreEnableParts::empty());
+            }
+        };
+
+        if freq > LPTMR_FCLK_MAX {
+            return Err(ClockError::BadConfig {
+                clock: "lptmr fclk",
+                reason: "exceeds max rating",
+            });
+        }
+
+        apply_div4!(self, clksel, clkdiv, variant, freq)
     }
 }
 
@@ -770,7 +860,7 @@ impl SPConfHelper for AdcConfig {
         // Check clock speed is reasonable
         let div = self.div.into_divisor();
         let expected = freq / div;
-        // 22.3.2 peripheral clock max functional clock limits
+        // 21.3.2 peripheral clock max functional clock limits
         let fmax = match clocks.active_power {
             VddLevel::MidDriveMode => 24_000_000,
             VddLevel::OverDriveMode => 64_000_000,

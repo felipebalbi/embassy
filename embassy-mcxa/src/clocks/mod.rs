@@ -1994,9 +1994,14 @@ macro_rules! impl_cc_gate {
 /// This module contains implementations of MRCC APIs, specifically of the [`Gate`] trait,
 /// for various low level peripherals.
 pub(crate) mod gate {
-    use super::periph_helpers::{AdcConfig, I3cConfig, Lpi2cConfig, LpuartConfig, NoConfig, OsTimerConfig};
+    use super::periph_helpers::{
+        AdcConfig, I3cConfig, LpTmrConfig, Lpi2cConfig, LpuartConfig, NoConfig, OsTimerConfig,
+    };
     use super::*;
     use crate::clocks::periph_helpers::CTimerConfig;
+
+    // These peripherals can select a clock source, but don't have a clock Gate.
+    // impl_cc_gate!(LPTMR0, mrcc_glb_cc0, mrcc_glb_rst0, lptmr0, LpTmrConfig);
 
     // These peripherals have no additional upstream clocks or configuration required
     // other than enabling through the MRCC gate. Currently, these peripherals will

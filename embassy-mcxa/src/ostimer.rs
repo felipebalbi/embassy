@@ -1,4 +1,4 @@
-//! Time Driver.
+//! OSTIMER Time Driver.
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 

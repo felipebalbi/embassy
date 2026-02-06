@@ -157,6 +157,8 @@ define_counters!(
     interrupt_i2c3_wake,
     interrupt_i3c0,
     interrupt_i3c0_wake,
+    interrupt_lptmr,
+    interrupt_lptmr_alarm,
     interrupt_lpuart0,
     interrupt_lpuart0_wake,
     interrupt_lpuart1,
