@@ -15,6 +15,7 @@ pub mod ctimer;
 pub mod dma;
 #[cfg(feature = "custom-executor")]
 pub mod executor;
+pub mod freqme;
 pub mod gpio;
 pub mod i2c;
 pub mod i3c;
