@@ -13,6 +13,7 @@ use crate::gpio::{GpioPin, SealedPin};
 use crate::{interrupt, pac};
 
 pub mod controller;
+pub mod target;
 
 /// I3C interrupt handler.
 pub struct InterruptHandler<T: Instance> {
