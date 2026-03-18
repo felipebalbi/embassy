@@ -10,6 +10,7 @@ use crate::gpio::GpioPin;
 use crate::{interrupt, pac};
 
 pub mod controller;
+pub mod target;
 
 pub(crate) mod sealed {
     /// Seal a trait
