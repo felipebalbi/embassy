@@ -76,14 +76,18 @@ impl From<crate::dma::InvalidParameters> for IOError {
     }
 }
 
+/// Whether to send a STOP condition after the transfer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SendStop {
+    /// Do not send STOP (for repeated-START sequences).
     #[default]
     No,
+    /// Send STOP after the transfer.
     Yes,
 }
 
+/// Bus transfer type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[allow(dead_code)]
@@ -1234,7 +1238,7 @@ where
     /// Wait for a target IBI, ACK it, drain any payload bytes, and emit STOP.
     ///
     /// Returns the IBI target address and the number of payload bytes written into `buf`.
-    /// The P3T1755 (and most sensors) set BCR[2]=0 so no payload bytes follow the address header;
+    /// The P3T1755 (and most sensors) set BCR\[2\]=0 so no payload bytes follow the address header;
     /// in that case this returns `(addr, 0)`.
     pub async fn async_wait_for_ibi(&mut self, buf: &mut [u8]) -> Result<(u8, usize), IOError> {
         // Step 1: Wait for SLVSTART (a target is asserting SDA low to request the bus).
@@ -1410,8 +1414,20 @@ where
 ///
 /// Several operations can be combined as part of a single transaction.
 pub enum Operation<'a> {
-    Read { address: u8, buf: &'a mut [u8] },
-    Write { address: u8, buf: &'a [u8] },
+    /// Read from the given address into the buffer.
+    Read {
+        /// Target address.
+        address: u8,
+        /// Buffer to read into.
+        buf: &'a mut [u8],
+    },
+    /// Write the buffer contents to the given address.
+    Write {
+        /// Target address.
+        address: u8,
+        /// Data to write.
+        buf: &'a [u8],
+    },
 }
 
 impl<'d, M: Mode> Drop for I3c<'d, M> {
