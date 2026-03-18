@@ -1,10 +1,12 @@
 //! I3C Controller driver.
 
+use core::marker::PhantomData;
+
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 use nxp_pac::i3c::{MdmactrlDmafb, MdmactrlDmatb};
 
-use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, InterruptHandler, Mode, SclPin, SdaPin};
+use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, I3cClockSel, I3cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
 use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, TransferOptions};
@@ -1337,6 +1339,40 @@ where
             embedded_hal_async::i2c::Operation::Write(buf) => {
                 <Self as AsyncEngine>::async_write_internal(self, address, buf, BusType::I2c, SendStop::Yes).await
             }
+        }
+    }
+}
+
+/// I3C interrupt handler.
+pub struct InterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Instance> typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        let status = T::info().regs().mintmasked().read();
+        T::PERF_INT_INCR();
+
+        if status.nowmaster()
+            || status.complete()
+            || status.mctrldone()
+            || status.slvstart()
+            || status.errwarn()
+            || status.rxpend()
+            || status.txnotfull()
+        {
+            T::info().regs().mintclr().write(|w| {
+                w.set_nowmaster(true);
+                w.set_complete(true);
+                w.set_mctrldone(true);
+                w.set_slvstart(true);
+                w.set_errwarn(true);
+                w.set_rxpend(true);
+                w.set_txnotfull(true);
+            });
+
+            T::PERF_INT_WAKE_INCR();
+            T::info().wait_cell().wake();
         }
     }
 }
