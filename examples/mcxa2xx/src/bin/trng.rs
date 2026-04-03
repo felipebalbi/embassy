@@ -23,26 +23,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("TRNG example");
 
-    let mut trng = Trng::new_blocking_128(p.TRNG0.reborrow());
-    let rand = trng.blocking_next_u32();
-    defmt::info!("128-bit {}", rand);
-
-    drop(trng);
-
-    let mut trng = Trng::new_blocking_256(p.TRNG0.reborrow());
-    let rand = trng.blocking_next_u32();
-    defmt::info!("256-bit {}", rand);
-
-    drop(trng);
-
-    let mut trng = Trng::new_blocking_512(p.TRNG0.reborrow());
-    let rand = trng.blocking_next_u32();
-    defmt::info!("512-bit {}", rand);
-
-    drop(trng);
-
-    let config = trng::Config::default();
-    let mut trng = Trng::new_blocking_with_custom_config(p.TRNG0.reborrow(), config);
+    let mut trng = Trng::new_blocking(p.TRNG0.reborrow(), Default::default());
 
     defmt::info!("========== BLOCKING ==========");
 
@@ -83,7 +64,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("========== ASYNC ==========");
 
-    let mut trng = Trng::new_with_custom_config(p.TRNG0.reborrow(), Irqs, config);
+    let mut trng = Trng::new_async(p.TRNG0.reborrow(), Irqs, Default::default());
 
     defmt::info!("Generate 10 u32");
     for _ in 0..10 {
