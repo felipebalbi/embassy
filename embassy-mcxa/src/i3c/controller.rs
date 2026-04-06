@@ -174,14 +174,18 @@ impl Default for ClockConfig {
     }
 }
 
+fn calculate_error(cur_freq: u32, desired_freq: u32) -> u32 {
+    let delta = cur_freq.abs_diff(desired_freq);
+    delta * 100 / desired_freq
+}
+
+/// DAA Provisional Device
+///
+/// Only used during address assignment phase.
 #[derive(Debug, Clone, Copy)]
-pub struct DaaTargetInfo {
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ProvisionalDevice {
     /// 48-bit Provisional ID (PID)
-    ///
-    /// Layout (per I3C spec):
-    /// - [47:33] Manufacturer ID
-    /// - [32]     ID type
-    /// - [31:0]   Part ID / Instance ID
     pub pid: u64,
 
     /// Bus Characteristics Register
@@ -191,9 +195,139 @@ pub struct DaaTargetInfo {
     pub dcr: u8,
 }
 
-fn calculate_error(cur_freq: u32, desired_freq: u32) -> u32 {
-    let delta = cur_freq.abs_diff(desired_freq);
-    delta * 100 / desired_freq
+pub struct DaaSession<'d> {
+    info: &'static Info,
+    _wg: Option<WakeGuard>,
+    _phantom: PhantomData<&'d mut ()>,
+}
+
+// ====== DAA Implementation ======
+
+impl<'d> DaaSession<'d> {
+    /// Fetch next device participating in DAA
+    pub fn next(&mut self) -> Option<ProvisionalDevice> {
+        // Wait for controller event
+        loop {
+            let s = self.info.regs().mstatus().read();
+
+            if s.errwarn() {
+                return None;
+            }
+
+            if s.complete() {
+                return None;
+            }
+
+            if s.mctrldone() {
+                break;
+            }
+        }
+
+        // Read exactly 8 bytes from the RX FIFO: PID[6] + BCR + DCR
+        let mut buf = [0u8; 8];
+        for b in &mut buf {
+            while self.info.regs().mdatactrl().read().rxempty() {}
+            *b = self.info.regs().mrdatab().read().value();
+        }
+
+        // Decode PID
+        let pid = ((buf[0] as u64) << 40)
+            | ((buf[1] as u64) << 32)
+            | ((buf[2] as u64) << 24)
+            | ((buf[3] as u64) << 16)
+            | ((buf[4] as u64) << 8)
+            | (buf[5] as u64);
+
+        let bcr = buf[6];
+        let dcr = buf[7];
+
+        // Clear status flags
+        // self.info.regs().mstatus().write(|w| {
+        //     w.set_slvstart(true);
+        //     w.set_mctrldone(true);
+        //     w.set_complete(true);
+        //     w.set_ibiwon(true);
+        //     w.set_nowmaster(true);
+        // });
+
+        Some(ProvisionalDevice { pid, bcr, dcr })
+    }
+
+    /// Assign dynamic address to the *current* device
+    pub fn assign_address(&mut self, address: u8) -> Result<(), IOError> {
+        if address == 0 || address >= 0x7e {
+            return Err(IOError::AddressOutOfRange(address));
+        }
+
+        // compute parity bit
+        let parity = if address.count_ones() & 1 == 0 { 1 } else { 0 };
+        let da_byte = (address << 1) | parity;
+
+        // Write DA
+        self.info.regs().mwdatab().write(|w| {
+            w.set_value(da_byte);
+        });
+
+        // Trigger DAA processing
+        self.info.regs().mctrl().write(|w| {
+            w.set_request(Request::PROCESSDAA);
+        });
+
+        // Wait for completion
+        loop {
+            let s = self.info.regs().mstatus().read();
+
+            if s.errwarn() {
+                let merrwarn = self.info.regs().merrwarn().read();
+
+                if merrwarn.urun() {
+                    return Err(IOError::Underrun);
+                } else if merrwarn.nack() {
+                    return Err(IOError::Nack);
+                } else if merrwarn.wrabt() {
+                    return Err(IOError::WriteAbort);
+                } else if merrwarn.term() {
+                    return Err(IOError::Terminate);
+                } else if merrwarn.hpar() {
+                    return Err(IOError::HighDataRateParity);
+                } else if merrwarn.hcrc() {
+                    return Err(IOError::HighDataRateCrc);
+                } else if merrwarn.oread() {
+                    return Err(IOError::Overread);
+                } else if merrwarn.owrite() {
+                    return Err(IOError::Overwrite);
+                } else if merrwarn.msgerr() {
+                    return Err(IOError::Message);
+                } else if merrwarn.invreq() {
+                    return Err(IOError::InvalidRequest);
+                } else if merrwarn.timeout() {
+                    return Err(IOError::Timeout);
+                } else {
+                    // should never happen
+                    return Err(IOError::Other);
+                }
+            }
+
+            if s.nacked() {
+                return Err(IOError::Nack);
+            }
+
+            if s.mctrldone() || s.complete() {
+                break;
+            }
+        }
+
+        // Clear flags
+        self.info.regs().mstatus().write(|w| {
+            w.set_slvstart(true);
+            w.set_mctrldone(true);
+            w.set_complete(true);
+            w.set_ibiwon(true);
+            w.set_nowmaster(true);
+        });
+
+        Ok(())
+    }
 }
 
 /// I3C controller driver.
@@ -623,119 +757,24 @@ impl<'d, M: Mode> I3c<'d, M> {
         self.blocking_write(0x7e, &[0x06], BusType::I3cSdr)
     }
 
-    /// Enter dynamic address assignment mode.
-    ///
-    /// NOTE:
-    ///
-    /// We do NOT emit PROCESSDAA here.  We only ensure the controller
-    /// is ready.
-    ///
-    /// DAA actually starts when next_daa_target() issues REQUEST =
-    /// PROCESSDAA.
-    pub fn blocking_enter_daa(&mut self) -> Result<(), IOError> {
-        self.info.regs().mstatus().write(|w| {
-            w.set_complete(true);
-            w.set_errwarn(true);
-        });
-
+    /// DAA sequence
+    pub fn daa<F>(&mut self, f: F) -> Result<(), IOError>
+    where
+        F: FnOnce(DaaSession<'_>),
+    {
+        // Start DAA sequence
         self.info.regs().mctrl().write(|w| {
             w.set_request(Request::PROCESSDAA);
         });
 
-        Ok(())
-    }
+        let session = DaaSession {
+            info: self.info,
+            _wg: self._wg.clone(),
+            _phantom: PhantomData,
+        };
 
-    pub fn blocking_next_daa_target(&mut self) -> Result<Option<DaaTargetInfo>, IOError> {
-        loop {
-            let s = self.info.regs().mstatus().read();
+        f(session);
 
-            if s.errwarn() {
-                return Err(IOError::Other);
-            }
-
-            if s.complete() {
-                // No more targets: controller already issued STOP
-                return Ok(None);
-            }
-
-            if s.mctrldone() {
-                break;
-            }
-        }
-
-        let mut buf = [0u8; 8];
-        for b in &mut buf {
-            while self.info.regs().mdatactrl().read().rxempty() {}
-            *b = self.info.regs().mrdatab().read().value();
-        }
-
-        // Decode fields
-        let pid = ((buf[0] as u64) << 40)
-            | ((buf[1] as u64) << 32)
-            | ((buf[2] as u64) << 24)
-            | ((buf[3] as u64) << 16)
-            | ((buf[4] as u64) << 8)
-            | (buf[5] as u64);
-
-        let bcr = buf[6];
-        let dcr = buf[7];
-
-        // 5. Clear any stale completion/error flags
-        self.info.regs().mstatus().write(|w| {
-            w.set_complete(true);
-            w.set_errwarn(true);
-        });
-
-        Ok(Some(DaaTargetInfo { pid, bcr, dcr }))
-    }
-
-    pub fn blocking_assign_daa(&mut self, address: u8) -> Result<(), IOError> {
-        if address == 0 || address >= 0x7e {
-            return Err(IOError::AddressOutOfRange(address));
-        }
-
-        let regs = self.info.regs();
-
-        let parity = if address.count_ones() & 1 == 0 { 1 } else { 0 };
-        let da_byte = (address << 1) | parity;
-
-        // 4. Write DA byte
-        regs.mwdatab().write(|w| w.set_value(da_byte));
-
-        // 5. Request DA emission
-        regs.mctrl().write(|w| {
-            w.set_request(Request::PROCESSDAA);
-        });
-
-        // 6. Wait for completion
-        loop {
-            let s = regs.mstatus().read();
-
-            if s.errwarn() {
-                defmt::info!("{}", self.info.regs().merrwarn().read());
-                return Err(IOError::Other);
-            }
-
-            if s.nacked() {
-                return Err(IOError::Nack);
-            }
-
-            if s.mctrldone() || s.complete() {
-                break;
-            }
-        }
-
-        // 7. Clear DONE / NACK
-        regs.mstatus().write(|w| {
-            w.set_mctrldone(true);
-            w.set_errwarn(true);
-            w.set_nacked(true);
-        });
-
-        Ok(())
-    }
-
-    pub fn blocking_end_daa(&mut self) -> Result<(), IOError> {
         Ok(())
     }
 
