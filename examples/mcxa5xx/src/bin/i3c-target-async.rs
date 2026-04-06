@@ -72,28 +72,21 @@ async fn main(_spawner: Spawner) {
     config.clock_config.source = I3cClockSel::FroHfDiv;
     config.clock_config.div = Div4::from_divisor(2).unwrap();
     config.address = Some(0x2a);
+    config.ibi_capable = true; // Advertise IBI capability in BCR[1]
 
     let mut target = target::I3c::new_async(p.I3C0, p.P0_21, p.P0_20, Irqs, config).unwrap();
     let mut rx_buf = [0u8; 32];
-    let tx_buf = [0x2au8; 32];
 
     loop {
+        // Wait for a write from the controller.
         let rx_count = target.async_respond_to_write(&mut rx_buf).await.unwrap();
-        defmt::info!("T [W]: {:02x}", rx_buf[..rx_count]);
+        defmt::info!("T [W] ({}): {:02x}", rx_count, rx_buf[..rx_count]);
 
-        match target.async_respond_to_read(&tx_buf).await.unwrap() {
-            target::ReadStatus::EarlyStop(count) => {
-                defmt::info!("T [W]: {:02x}", rx_buf[..rx_count]);
-                defmt::info!("T [Re] ({}): {:02x}", count, tx_buf[..count]);
-            }
-            target::ReadStatus::Complete(count) => {
-                defmt::info!("T [W]: {:02x}", rx_buf[..rx_count]);
-                defmt::info!("T [Rc] ({}): {:02x}", count, tx_buf[..count]);
-            }
-            target::ReadStatus::Incomplete(count) => {
-                defmt::info!("T [W]: {:02x}", rx_buf[..rx_count]);
-                defmt::info!("T [Ri] ({}): {:02x}", count, tx_buf[..count]);
-            }
+        // Signal the controller that the write was processed.
+        match target.async_send_ibi(&[]).await {
+            Ok(()) => defmt::info!("IBI ACKed by controller"),
+            Err(target::IOError::IbiNacked) => defmt::warn!("IBI NACKed"),
+            Err(e) => defmt::error!("IBI error: {:?}", e),
         }
     }
 }

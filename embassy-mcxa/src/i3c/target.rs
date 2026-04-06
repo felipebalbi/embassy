@@ -12,7 +12,7 @@ use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt::typelevel;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::i3c::Sstatus;
-use crate::pac::i3c::{Mstena, SstatusStart, SstatusTxnotfull, Stnotstop, Type};
+use crate::pac::i3c::{Evdet, Mstena, SctrlEvent, SstatusStart, SstatusTxnotfull, Stnotstop, Type};
 
 /// Setup Errors
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -58,6 +58,8 @@ pub enum IOError {
     Overread,
     /// Overwrite
     Overwrite,
+    /// IBI request was NACKed by the controller and won't be retried.
+    IbiNacked,
     /// Other internal errors or unexpected state.
     Other,
 }
@@ -115,6 +117,19 @@ pub struct Config {
     /// will be clamped accordingly.
     pub max_read_len: u16,
 
+    /// Advertise IBI request capability (BCR[1]).
+    ///
+    /// When `true`, the controller can see via `GETBCR` that this target
+    /// is capable of generating In-Band Interrupts.  Set this before
+    /// calling [`I3c::async_send_ibi`].
+    pub ibi_capable: bool,
+
+    /// Advertise that IBIs are followed by a mandatory data byte (BCR[2]).
+    ///
+    /// When `true`, the controller will expect one MDB byte to follow the
+    /// IBI address header.  Set `SCTRL.IBIDATA` before asserting the event.
+    pub ibi_has_payload: bool,
+
     /// Clock configuration
     pub clock_config: ClockConfig,
 }
@@ -127,6 +142,8 @@ impl Default for Config {
             partno: None,
             max_write_len: 256,
             max_read_len: 256,
+            ibi_capable: false,
+            ibi_has_payload: false,
             clock_config: ClockConfig::default(),
         }
     }
@@ -269,7 +286,7 @@ impl<'d, M: Mode> I3c<'d, M> {
             w.set_matchss(true);
             w.set_s0ignore(true);
             #[cfg(feature = "mcxa5xx")]
-            w.set_ddrok(true);
+            w.set_hdrok(true);
             w.set_bamatch((self.freq / 1_000_000 - 1) as u8);
         });
 
@@ -297,6 +314,11 @@ impl<'d, M: Mode> I3c<'d, M> {
             w.set_maxwr(config.max_write_len.clamp(8, 4095));
             w.set_maxrd(config.max_read_len.clamp(16, 4095));
         });
+
+        // Configure BCR (Bus Characteristics Register) — visible to the controller via GETBCR.
+        // BCR[1]: IBI Request Capable; BCR[2]: IBI Payload (mandatory data byte follows).
+        let bcr: u8 = if config.ibi_capable { 0x02 } else { 0 } | if config.ibi_has_payload { 0x04 } else { 0 };
+        self.info.regs().sidext().modify(|w| w.set_bcr(bcr));
 
         self.clear_status();
         self.flush_fifos();
@@ -604,6 +626,72 @@ where
         buf: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, IOError>> + 'a {
         <Self as AsyncEngine>::async_respond_to_write_internal(self, buf)
+    }
+
+    /// Asynchronously send an In-Band Interrupt (IBI) to the controller.
+    ///
+    /// Asserts an IBI request on the bus and waits for the controller to ACK it.
+    /// The device must be configured with `Config::ibi_capable = true` (and optionally
+    /// `Config::ibi_has_payload = true`) for this to be meaningful.
+    ///
+    /// If `payload` is non-empty, `payload[0]` is placed in `SCTRL.IBIDATA` as the
+    /// mandatory data byte (requires `ibi_has_payload = true` / BCR[2]=1).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` once the controller ACKs the IBI.
+    /// - `Err(IOError::IbiNacked)` if the controller permanently rejects the IBI.
+    /// - `Err(IOError)` for bus errors.
+    pub async fn async_send_ibi(&mut self, payload: &[u8]) -> Result<(), IOError> {
+        self.clear_status();
+        self.flush_fifos();
+
+        // Set mandatory data byte if the caller provided one.
+        self.info.regs().sctrl().modify(|w| {
+            if let Some(&b) = payload.first() {
+                w.set_ibidata(b);
+            }
+            w.set_event(SctrlEvent::IBI);
+        });
+
+        // Wait until the controller ACKs (EVDET = ACKED).
+        // The hardware retries automatically on NACK so SSTATUS.event may fire several
+        // times before reaching ACKED.  We clear the event flag each time so the next
+        // NACK/ACK still generates an interrupt.
+        self.info
+            .wait_cell()
+            .wait_for(|| {
+                self.info.regs().sintset().write(|w| {
+                    w.set_event(true);
+                    w.set_errwarn(true);
+                });
+
+                let status = self.info.regs().sstatus().read();
+
+                if status.errwarn() {
+                    return true;
+                }
+
+                if status.event() {
+                    // Clear the event flag so a future NACK→retry→ACK still fires.
+                    self.info.regs().sstatus().write(|w| w.set_event(true));
+                    return status.evdet() == Evdet::ACKED;
+                }
+
+                false
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        // Release EVENT field back to normal.
+        self.info
+            .regs()
+            .sctrl()
+            .modify(|w| w.set_event(SctrlEvent::NORMAL_MODE));
+
+        self.check_status()?;
+
+        Ok(())
     }
 }
 

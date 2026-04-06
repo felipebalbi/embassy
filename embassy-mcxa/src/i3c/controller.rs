@@ -15,7 +15,8 @@ pub use crate::i2c::controller::Speed;
 use crate::interrupt::typelevel;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::i3c::{
-    Disto, Hkeep, Ibiresp, MctrlDir as I3cDir, MdatactrlRxtrig, MdatactrlTxtrig, Mstena, Request, State, Type,
+    Disto, Hkeep, Ibiresp, Ibitype, MctrlDir as I3cDir, MdatactrlRxtrig, MdatactrlTxtrig, Mstena, Nobyte, Request,
+    State, Type,
 };
 
 const MAX_CHUNK_SIZE: usize = 255;
@@ -245,6 +246,58 @@ impl<'d, M: Mode> I3c<'d, M> {
             w.set_hkeep(Hkeep::NONE);
             w.set_odstop(false);
             w.set_odhpp(true);
+        });
+
+        Ok(())
+    }
+
+    /// Configure the IBI rules register for up to 5 IBI-capable target devices.
+    ///
+    /// Must be called before [`async_wait_for_ibi`] — the hardware uses this register
+    /// to know which addresses can send IBIs and whether they carry a mandatory data byte.
+    ///
+    /// All `addresses` must share the same value for bit 6 (the most-significant address bit),
+    /// and all must agree on `has_mandatory_byte` (BCR[2]).
+    ///
+    /// Returns `Err(SetupError::InvalidConfiguration)` if more than 5 addresses are provided
+    /// or if addresses have mixed MSBs.
+    pub fn configure_ibi(&mut self, addresses: &[u8], has_mandatory_byte: bool) -> Result<(), SetupError> {
+        if addresses.len() > 5 {
+            return Err(SetupError::InvalidConfiguration);
+        }
+
+        // All addresses must share the same bit-6 value.
+        let msb0 = if addresses.is_empty() {
+            false
+        } else {
+            let first_msb = (addresses[0] >> 6) & 1;
+            for &addr in &addresses[1..] {
+                if ((addr >> 6) & 1) != first_msb {
+                    return Err(SetupError::InvalidConfiguration);
+                }
+            }
+            // msb0 = true means "MSB (bit 6) of all addresses is 0"
+            first_msb == 0
+        };
+
+        self.info.regs().mibirules().write(|w| {
+            if addresses.len() > 0 {
+                w.set_addr0(addresses[0] & 0x3F);
+            }
+            if addresses.len() > 1 {
+                w.set_addr1(addresses[1] & 0x3F);
+            }
+            if addresses.len() > 2 {
+                w.set_addr2(addresses[2] & 0x3F);
+            }
+            if addresses.len() > 3 {
+                w.set_addr3(addresses[3] & 0x3F);
+            }
+            if addresses.len() > 4 {
+                w.set_addr4(addresses[4] & 0x3F);
+            }
+            w.set_msb0(msb0);
+            w.set_nobyte(if has_mandatory_byte { Nobyte::IBIBYTE } else { Nobyte::NO_IBIBYTE });
         });
 
         Ok(())
@@ -1103,24 +1156,114 @@ where
 
     // Public API: Async
 
-    /// Wait for a target IBI
-    pub async fn async_wait_for_ibi(&self) -> Result<u8, IOError> {
+    /// Wait for a target IBI, ACK it, drain any payload bytes, and emit STOP.
+    ///
+    /// Returns the IBI target address and the number of payload bytes written into `buf`.
+    /// The P3T1755 (and most sensors) set BCR[2]=0 so no payload bytes follow the address header;
+    /// in that case this returns `(addr, 0)`.
+    pub async fn async_wait_for_ibi(&mut self, buf: &mut [u8]) -> Result<(u8, usize), IOError> {
+        // Step 1: Wait for SLVSTART (a target is asserting SDA low to request the bus).
         self.info
             .wait_cell()
             .wait_for(|| {
-                // enable control done interrupt
+                self.info.regs().mintset().write(|w| {
+                    w.set_slvstart(true);
+                    w.set_errwarn(true);
+                });
+                let status = self.info.regs().mstatus().read();
+                status.slvstart() || status.errwarn()
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        self.status()?;
+
+        // Only proceed if the bus is in SLVREQ state.
+        if self.info.regs().mstatus().read().state() != State::SLVREQ {
+            return Err(IOError::Other);
+        }
+
+        // Step 2: Pre-clear IBIWON in case it was already set, so AUTO_IBI doesn't return early.
+        self.info.regs().mstatus().write(|w| w.set_ibiwon(true));
+
+        // Step 3: Issue AUTO_IBI with ACK — hardware handles the IBI protocol handshake.
+        self.info.regs().mctrl().write(|w| {
+            w.set_request(Request::AUTOIBI);
+            w.set_ibiresp(Ibiresp::ACK);
+        });
+
+        // Step 4: Wait for IBIWON — the IBI has been accepted and the address header received.
+        self.info
+            .wait_cell()
+            .wait_for(|| {
                 self.info.regs().mintset().write(|w| {
                     w.set_ibiwon(true);
                     w.set_errwarn(true);
                 });
-                // check IBI status
                 let status = self.info.regs().mstatus().read();
                 status.ibiwon() || status.errwarn()
             })
             .await
             .map_err(|_| IOError::Other)?;
 
-        Ok(self.info.regs().mstatus().read().ibiaddr())
+        self.status()?;
+
+        let mstatus = self.info.regs().mstatus().read();
+        let ibi_addr = mstatus.ibiaddr();
+        let ibi_type = mstatus.ibitype();
+
+        // Step 5: For normal IBIs (not Hot-Join or Controller-Request), drain the RX FIFO payload.
+        let mut payload_len = 0;
+        if ibi_type == Ibitype::IBI && !buf.is_empty() {
+            'read: for byte in buf.iter_mut() {
+                loop {
+                    // Drain available RX FIFO bytes.
+                    if self.info.regs().mdatactrl().read().rxcount() != 0 {
+                        *byte = self.info.regs().mrdatab().read().value();
+                        payload_len += 1;
+                        break;
+                    }
+
+                    // COMPLETE means the target has sent all its payload bytes.
+                    if self.info.regs().mstatus().read().complete() {
+                        break 'read;
+                    }
+
+                    // Wait for more bytes (rxpend) or end of message (complete).
+                    self.info
+                        .wait_cell()
+                        .wait_for(|| {
+                            self.info.regs().mintset().write(|w| {
+                                w.set_rxpend(true);
+                                w.set_complete(true);
+                                w.set_errwarn(true);
+                            });
+                            let s = self.info.regs().mstatus().read();
+                            s.rxpend() || s.complete() || s.errwarn()
+                        })
+                        .await
+                        .map_err(|_| IOError::Other)?;
+
+                    self.status()?;
+                }
+            }
+
+            // Drain any remaining bytes the caller's buffer couldn't hold.
+            while self.info.regs().mdatactrl().read().rxcount() != 0 {
+                let _ = self.info.regs().mrdatab().read().value();
+            }
+        }
+
+        // Step 6: Wait for COMPLETE (marks end of IBI reception, state transitions to NORMACT).
+        if !self.info.regs().mstatus().read().complete() {
+            self.async_wait_for_complete().await?;
+        }
+
+        // Step 7: Clear status flags, then emit STOP.
+        self.clear_flags();
+        self.async_stop(BusType::I3cSdr).await?;
+
+        Ok((ibi_addr, payload_len))
     }
 
     /// Read from address into buffer asynchronously.
@@ -1360,6 +1503,7 @@ impl<T: Instance> typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
             || status.errwarn()
             || status.rxpend()
             || status.txnotfull()
+            || status.ibiwon()
         {
             T::info().regs().mintclr().write(|w| {
                 w.set_nowmaster(true);
@@ -1369,6 +1513,7 @@ impl<T: Instance> typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
                 w.set_errwarn(true);
                 w.set_rxpend(true);
                 w.set_txnotfull(true);
+                w.set_ibiwon(true);
             });
 
             T::PERF_INT_WAKE_INCR();
