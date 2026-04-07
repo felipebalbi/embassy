@@ -9,7 +9,7 @@ use embassy_mcxa::clocks::config::{
 use embassy_mcxa::clocks::periph_helpers::{Div4, I3cClockSel};
 use embassy_time::Timer;
 use hal::bind_interrupts;
-use hal::i3c::controller::{self, BusType, I3c, InterruptHandler, Operation, SendStop};
+use hal::i3c::controller::{self, BusType, I3c, InterruptHandler, Operation};
 use hal::peripherals::I3C0;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
@@ -81,9 +81,10 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("after RstDaa");
 
-    let mut addr = 0x08;
+    let mut addr = 0x30;
     i3c.daa(|mut session| {
-        while let Some(dev) = session.next() {
+        while let Some(dev) = session.next_device() {
+            defmt::info!("Assigning addr {:02x} to {:02x}", addr, dev);
             session.assign_address(addr).unwrap();
             addr += 1;
         }
@@ -92,79 +93,74 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("Enumeration done");
 
-    Timer::after_micros(100).await;
+    // Doesn't seem to work without this delay. Why?!?
+    Timer::after_micros(500).await;
 
     /* ---------------------------
      * Normal bus operation
      * --------------------------- */
 
     defmt::info!("ENEC: enable IBIs");
-    for addr in 0x01..=0x7f {
-        if i3c
-            .async_transaction(
-                &mut [
-                    Operation::Write {
-                        address: 0x7e,
-                        buf: &[0x80],
-                    },
-                    Operation::Write {
-                        address: addr,
-                        buf: &[0x01], // Enable IBIs
-                    },
-                ],
-                BusType::I3cSdr,
-                SendStop::Yes,
-            )
-            .await
-            .is_ok()
-        {
-            defmt::info!("ENEC enabled for {:02x}", addr);
-        }
-    }
-
-    defmt::info!("CONFIG");
-    let low = celsius_to_raw(25.0);
-    let high = celsius_to_raw(27.0);
     i3c.async_transaction(
         &mut [
             Operation::Write {
-                address: 0x10,
-                buf: &[0x02, low[0], low[1]], // Low limit = 25C
+                address: 0x7e,
+                buf: &[0x80],
             },
             Operation::Write {
-                address: 0x10,
-                buf: &[0x03, high[0], high[1]], // High Limit = 31C
-            },
-            Operation::Write {
-                address: 0x10,
-                buf: &[0x01, 0x28],
+                address: 0x30,
+                buf: &[0x01], // Enable IBIs
             },
         ],
         BusType::I3cSdr,
-        SendStop::Yes,
     )
     .await
     .unwrap();
 
-    let mut buf = [0u8; 2];
-
-    i3c.async_write_read(0x10, &[0x02], &mut buf, BusType::I3cSdr)
+    defmt::info!("CONFIG");
+    let low = celsius_to_raw(25.0);
+    let high = celsius_to_raw(27.0);
+    if i3c
+        .async_transaction(
+            &mut [
+                Operation::Write {
+                    address: 0x30,
+                    buf: &[0x02, low[0], low[1]], // Low limit = 25C
+                },
+                Operation::Write {
+                    address: 0x30,
+                    buf: &[0x03, high[0], high[1]], // High Limit = 31C
+                },
+                Operation::Write {
+                    address: 0x30,
+                    buf: &[0x01, 0x28],
+                },
+            ],
+            BusType::I3cSdr,
+        )
         .await
-        .unwrap();
-    defmt::info!("raw low {:02x}", buf);
-    let low = raw_to_celsius(buf);
+        .is_ok()
+    {
+        let mut buf = [0u8; 2];
 
-    i3c.async_write_read(0x10, &[0x03], &mut buf, BusType::I3cSdr)
-        .await
-        .unwrap();
-    let high = raw_to_celsius(buf);
+        i3c.async_write_read(0x30, &[0x02], &mut buf, BusType::I3cSdr)
+            .await
+            .unwrap();
+        defmt::info!("raw low {:02x}", buf);
+        let low = raw_to_celsius(buf);
 
-    i3c.async_write_read(0x10, &[0x00], &mut buf, BusType::I3cSdr)
-        .await
-        .unwrap();
-    let current = raw_to_celsius(buf);
+        i3c.async_write_read(0x30, &[0x03], &mut buf, BusType::I3cSdr)
+            .await
+            .unwrap();
+        let high = raw_to_celsius(buf);
 
-    defmt::info!("low {}C high {}C current {}C", low, high, current);
+        i3c.async_write_read(0x30, &[0x00], &mut buf, BusType::I3cSdr)
+            .await
+            .unwrap();
+        let current = raw_to_celsius(buf);
+
+        defmt::info!("low {}C high {}C current {}C", low, high, current);
+    }
 
     loop {
         defmt::info!("Waiting for IBI...");

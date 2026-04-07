@@ -79,7 +79,7 @@ impl From<crate::dma::InvalidParameters> for IOError {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum SendStop {
+enum SendStop {
     #[default]
     No,
     Yes,
@@ -185,8 +185,11 @@ fn calculate_error(cur_freq: u32, desired_freq: u32) -> u32 {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ProvisionalDevice {
-    /// 48-bit Provisional ID (PID)
-    pub pid: u64,
+    /// Vendor ID
+    pub vid: u16,
+
+    /// Part number
+    pub partno: u32,
 
     /// Bus Characteristics Register
     pub bcr: u8,
@@ -205,7 +208,7 @@ pub struct DaaSession<'d> {
 
 impl<'d> DaaSession<'d> {
     /// Fetch next device participating in DAA
-    pub fn next(&mut self) -> Option<ProvisionalDevice> {
+    pub fn next_device(&mut self) -> Option<ProvisionalDevice> {
         // Wait for controller event
         loop {
             let s = self.info.regs().mstatus().read();
@@ -218,7 +221,7 @@ impl<'d> DaaSession<'d> {
                 return None;
             }
 
-            if s.mctrldone() {
+            if s.mctrldone() && s.state() == State::DAA {
                 break;
             }
         }
@@ -230,27 +233,13 @@ impl<'d> DaaSession<'d> {
             *b = self.info.regs().mrdatab().read().value();
         }
 
-        // Decode PID
-        let pid = ((buf[0] as u64) << 40)
-            | ((buf[1] as u64) << 32)
-            | ((buf[2] as u64) << 24)
-            | ((buf[3] as u64) << 16)
-            | ((buf[4] as u64) << 8)
-            | (buf[5] as u64);
-
+        // Decode data
+        let vid = (((buf[0] as u16) << 8) | (buf[1] as u16)) >> 1;
+        let partno = ((buf[2] as u32) << 24) | (buf[3] as u32) << 16 | (buf[4] as u32) << 8 | (buf[5] as u32);
         let bcr = buf[6];
         let dcr = buf[7];
 
-        // Clear status flags
-        // self.info.regs().mstatus().write(|w| {
-        //     w.set_slvstart(true);
-        //     w.set_mctrldone(true);
-        //     w.set_complete(true);
-        //     w.set_ibiwon(true);
-        //     w.set_nowmaster(true);
-        // });
-
-        Some(ProvisionalDevice { pid, bcr, dcr })
+        Some(ProvisionalDevice { vid, partno, bcr, dcr })
     }
 
     /// Assign dynamic address to the *current* device
@@ -259,72 +248,11 @@ impl<'d> DaaSession<'d> {
             return Err(IOError::AddressOutOfRange(address));
         }
 
-        // compute parity bit
-        let parity = if address.count_ones() & 1 == 0 { 1 } else { 0 };
-        let da_byte = (address << 1) | parity;
-
         // Write DA
-        self.info.regs().mwdatab().write(|w| {
-            w.set_value(da_byte);
-        });
+        self.info.regs().mwdatab().write(|w| w.set_value(address));
 
         // Trigger DAA processing
-        self.info.regs().mctrl().write(|w| {
-            w.set_request(Request::PROCESSDAA);
-        });
-
-        // Wait for completion
-        loop {
-            let s = self.info.regs().mstatus().read();
-
-            if s.errwarn() {
-                let merrwarn = self.info.regs().merrwarn().read();
-
-                if merrwarn.urun() {
-                    return Err(IOError::Underrun);
-                } else if merrwarn.nack() {
-                    return Err(IOError::Nack);
-                } else if merrwarn.wrabt() {
-                    return Err(IOError::WriteAbort);
-                } else if merrwarn.term() {
-                    return Err(IOError::Terminate);
-                } else if merrwarn.hpar() {
-                    return Err(IOError::HighDataRateParity);
-                } else if merrwarn.hcrc() {
-                    return Err(IOError::HighDataRateCrc);
-                } else if merrwarn.oread() {
-                    return Err(IOError::Overread);
-                } else if merrwarn.owrite() {
-                    return Err(IOError::Overwrite);
-                } else if merrwarn.msgerr() {
-                    return Err(IOError::Message);
-                } else if merrwarn.invreq() {
-                    return Err(IOError::InvalidRequest);
-                } else if merrwarn.timeout() {
-                    return Err(IOError::Timeout);
-                } else {
-                    // should never happen
-                    return Err(IOError::Other);
-                }
-            }
-
-            if s.nacked() {
-                return Err(IOError::Nack);
-            }
-
-            if s.mctrldone() || s.complete() {
-                break;
-            }
-        }
-
-        // Clear flags
-        self.info.regs().mstatus().write(|w| {
-            w.set_slvstart(true);
-            w.set_mctrldone(true);
-            w.set_complete(true);
-            w.set_ibiwon(true);
-            w.set_nowmaster(true);
-        });
+        self.info.regs().mctrl().write(|w| w.set_request(Request::PROCESSDAA));
 
         Ok(())
     }
@@ -572,6 +500,21 @@ impl<'d, M: Mode> I3c<'d, M> {
         });
     }
 
+    fn clear_errors(&self) {
+        self.info.regs().merrwarn().write(|w| {
+            w.set_urun(true);
+            w.set_nack(true);
+            w.set_wrabt(true);
+            w.set_hpar(true);
+            w.set_hcrc(true);
+            w.set_oread(true);
+            w.set_owrite(true);
+            w.set_msgerr(true);
+            w.set_invreq(true);
+            w.set_timeout(true);
+        });
+    }
+
     fn blocking_wait_for_ctrldone(&self) {
         while !self.info.regs().mstatus().read().mctrldone() {}
     }
@@ -762,6 +705,14 @@ impl<'d, M: Mode> I3c<'d, M> {
     where
         F: FnOnce(DaaSession<'_>),
     {
+        // Check if the bus is already in use.
+        if self.info.regs().mstatus().read().state() != State::IDLE {
+            return Err(IOError::Other);
+        }
+
+        self.clear_errors();
+        self.clear_flags();
+
         // Start DAA sequence
         self.info.regs().mctrl().write(|w| {
             w.set_request(Request::PROCESSDAA);
@@ -774,6 +725,9 @@ impl<'d, M: Mode> I3c<'d, M> {
         };
 
         f(session);
+
+        self.clear_flags();
+        self.clear_errors();
 
         Ok(())
     }
@@ -1485,7 +1439,6 @@ where
         &'a mut self,
         operations: &'a mut [Operation<'a>],
         bus_type: BusType,
-        send_stop: SendStop,
     ) -> Result<(), IOError> {
         let Some((last, rest)) = operations.split_last_mut() else {
             return Ok(());
@@ -1504,10 +1457,10 @@ where
 
         match last {
             Operation::Read { address, buf } => {
-                <Self as AsyncEngine>::async_read_internal(self, *address, buf, bus_type, send_stop).await
+                <Self as AsyncEngine>::async_read_internal(self, *address, buf, bus_type, SendStop::Yes).await
             }
             Operation::Write { address, buf } => {
-                <Self as AsyncEngine>::async_write_internal(self, *address, buf, bus_type, send_stop).await
+                <Self as AsyncEngine>::async_write_internal(self, *address, buf, bus_type, SendStop::Yes).await
             }
         }
     }
