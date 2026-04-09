@@ -9,7 +9,7 @@ use embassy_mcxa::clocks::config::{
 use embassy_mcxa::clocks::periph_helpers::{Div4, I3cClockSel};
 use embassy_time::Timer;
 use hal::bind_interrupts;
-use hal::i3c::controller::{self, BusType, I3c, InterruptHandler, Operation};
+use hal::i3c::controller::{self, BusType, DeviceInfo, I3c, InterruptHandler, Operation};
 use hal::peripherals::I3C0;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
@@ -81,17 +81,11 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("after RstDaa");
 
-    let mut addr = 0x30;
-    i3c.daa(|mut session| {
-        while let Some(dev) = session.next_device() {
-            defmt::info!("Assigning addr {:02x} to {:02x}", addr, dev);
-            session.assign_address(addr).unwrap();
-            addr += 1;
-        }
-    })
-    .unwrap();
+    let addr = 0x30;
+    let mut devices = [DeviceInfo::new(); 1];
 
-    defmt::info!("Enumeration done");
+    i3c.daa(&mut devices, addr).unwrap();
+    defmt::info!("{:x}", devices);
 
     // Doesn't seem to work without this delay. Why?!?
     Timer::after_micros(500).await;
@@ -161,6 +155,8 @@ async fn main(_spawner: Spawner) {
 
         defmt::info!("low {}C high {}C current {}C", low, high, current);
     }
+
+    i3c.configure_ibi(&[0x30], false).unwrap();
 
     loop {
         defmt::info!("Waiting for IBI...");

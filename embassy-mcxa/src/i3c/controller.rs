@@ -179,12 +179,10 @@ fn calculate_error(cur_freq: u32, desired_freq: u32) -> u32 {
     delta * 100 / desired_freq
 }
 
-/// DAA Provisional Device
-///
-/// Only used during address assignment phase.
+/// DAA device information
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct ProvisionalDevice {
+pub struct DeviceInfo {
     /// Vendor ID
     pub vid: u16,
 
@@ -196,65 +194,21 @@ pub struct ProvisionalDevice {
 
     /// Device Characteristics Register
     pub dcr: u8,
+
+    /// Dynamic address
+    pub addr: u8,
 }
 
-pub struct DaaSession<'d> {
-    info: &'static Info,
-    _wg: Option<WakeGuard>,
-    _phantom: PhantomData<&'d mut ()>,
-}
-
-// ====== DAA Implementation ======
-
-impl<'d> DaaSession<'d> {
-    /// Fetch next device participating in DAA
-    pub fn next_device(&mut self) -> Option<ProvisionalDevice> {
-        // Wait for controller event
-        loop {
-            let s = self.info.regs().mstatus().read();
-
-            if s.errwarn() {
-                return None;
-            }
-
-            if s.complete() {
-                return None;
-            }
-
-            if s.mctrldone() && s.state() == State::DAA {
-                break;
-            }
+impl DeviceInfo {
+    // Create a new Device Info
+    pub const fn new() -> Self {
+        Self {
+            vid: 0,
+            partno: 0,
+            bcr: 0,
+            dcr: 0,
+            addr: 0,
         }
-
-        // Read exactly 8 bytes from the RX FIFO: PID[6] + BCR + DCR
-        let mut buf = [0u8; 8];
-        for b in &mut buf {
-            while self.info.regs().mdatactrl().read().rxempty() {}
-            *b = self.info.regs().mrdatab().read().value();
-        }
-
-        // Decode data
-        let vid = (((buf[0] as u16) << 8) | (buf[1] as u16)) >> 1;
-        let partno = ((buf[2] as u32) << 24) | (buf[3] as u32) << 16 | (buf[4] as u32) << 8 | (buf[5] as u32);
-        let bcr = buf[6];
-        let dcr = buf[7];
-
-        Some(ProvisionalDevice { vid, partno, bcr, dcr })
-    }
-
-    /// Assign dynamic address to the *current* device
-    pub fn assign_address(&mut self, address: u8) -> Result<(), IOError> {
-        if address == 0 || address >= 0x7e {
-            return Err(IOError::AddressOutOfRange(address));
-        }
-
-        // Write DA
-        self.info.regs().mwdatab().write(|w| w.set_value(address));
-
-        // Trigger DAA processing
-        self.info.regs().mctrl().write(|w| w.set_request(Request::PROCESSDAA));
-
-        Ok(())
     }
 }
 
@@ -701,10 +655,13 @@ impl<'d, M: Mode> I3c<'d, M> {
     }
 
     /// DAA sequence
-    pub fn daa<F>(&mut self, f: F) -> Result<(), IOError>
-    where
-        F: FnOnce(DaaSession<'_>),
-    {
+    pub fn daa(&mut self, devices: &mut [DeviceInfo], starting_address: u8) -> Result<(), IOError> {
+        let mut address = starting_address;
+
+        if address == 0 || address >= 0x7e || (address as usize) + devices.len() >= 0x7e {
+            return Err(IOError::AddressOutOfRange(address));
+        }
+
         // Check if the bus is already in use.
         if self.info.regs().mstatus().read().state() != State::IDLE {
             return Err(IOError::Other);
@@ -718,13 +675,53 @@ impl<'d, M: Mode> I3c<'d, M> {
             w.set_request(Request::PROCESSDAA);
         });
 
-        let session = DaaSession {
-            info: self.info,
-            _wg: self._wg.clone(),
-            _phantom: PhantomData,
-        };
+        // Here
+        for device in devices {
+            // Wait for controller event
+            loop {
+                let s = self.info.regs().mstatus().read();
 
-        f(session);
+                if s.errwarn() {
+                    return self.status();
+                }
+
+                if s.complete() {
+                    return Err(IOError::Other);
+                }
+
+                if s.mctrldone() && s.state() == State::DAA {
+                    break;
+                }
+            }
+
+            // Read exactly 8 bytes from the RX FIFO: PID[6] + BCR + DCR
+            let mut buf = [0u8; 8];
+            for b in &mut buf {
+                while self.info.regs().mdatactrl().read().rxempty() {}
+                *b = self.info.regs().mrdatab().read().value();
+            }
+
+            // Decode data
+            let vid = (((buf[0] as u16) << 8) | (buf[1] as u16)) >> 1;
+            let partno = ((buf[2] as u32) << 24) | (buf[3] as u32) << 16 | (buf[4] as u32) << 8 | (buf[5] as u32);
+            let bcr = buf[6];
+            let dcr = buf[7];
+
+            // Update the device data
+            device.vid = vid;
+            device.partno = partno;
+            device.bcr = bcr;
+            device.dcr = dcr;
+            device.addr = address;
+
+            // Write DA
+            self.info.regs().mwdatab().write(|w| w.set_value(address));
+
+            // Trigger DAA processing
+            self.info.regs().mctrl().write(|w| w.set_request(Request::PROCESSDAA));
+
+            address += 1;
+        }
 
         self.clear_flags();
         self.clear_errors();
