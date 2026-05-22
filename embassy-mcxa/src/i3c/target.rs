@@ -18,7 +18,7 @@ use grounded::uninit::GroundedCell;
 use super::{Info, Instance, SclPin, SdaPin};
 pub use crate::clocks::periph_helpers::{Div4, I3cClockSel, I3cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
-use crate::dma::{Channel, DmaChannel, DmaRequest, TransferOptions};
+use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest, TransferOptions};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt::typelevel;
 use crate::interrupt::typelevel::Interrupt;
@@ -498,6 +498,8 @@ impl<'d> I3c<'d> {
     ///   buffer. Each RX DMA grant is opened at this size, guaranteeing
     ///   a single transaction is never split across a BBQ ring wrap.
     ///   Choose `>=` the largest controller write you expect (e.g. 64).
+    ///   Must not exceed [`crate::dma::DMA_MAX_TRANSFER_SIZE`] (a single
+    ///   eDMA descriptor's BITER/CITER cap, 0x7FFF bytes).
     /// - `_irq`: The interrupt binding for the I3C peripheral.
     /// - `config`: The configuration for the I3C target.
     ///
@@ -516,7 +518,10 @@ impl<'d> I3c<'d> {
         max_rx_transaction: usize,
         config: Config,
     ) -> Result<Self, SetupError> {
-        if max_rx_transaction == 0 || rx_buffer.len() < 2 * max_rx_transaction {
+        if max_rx_transaction == 0
+            || max_rx_transaction > DMA_MAX_TRANSFER_SIZE
+            || rx_buffer.len() < 2 * max_rx_transaction
+        {
             return Err(SetupError::InvalidConfiguration);
         }
 
@@ -793,7 +798,12 @@ impl<'d> I3c<'d> {
         });
 
         if !rest.is_empty() {
-            self.dma_tx_arm(rest)?;
+            // Only arm the FIRST chunk before IBI. For payloads larger
+            // than `DMA_MAX_TRANSFER_SIZE` we cannot fit `rest` into a
+            // single descriptor; subsequent chunks are armed after IBI
+            // fires (controller is then clocking, so DMA always drains).
+            let first = rest.chunks(DMA_MAX_TRANSFER_SIZE).next().unwrap();
+            self.dma_tx_arm(first)?;
         }
 
         // Make sure the bus is actually idle before raising the IBI.
@@ -839,26 +849,20 @@ impl<'d> I3c<'d> {
         // Wait for DMA to drain `rest` into the FIFO. Safe to await here:
         // the controller is now draining the FIFO so DMA always makes
         // progress to completion.
+        //
+        // For payloads larger than `DMA_MAX_TRANSFER_SIZE`, `dma_tx_arm`
+        // above only programmed the first chunk; we drain it, then loop
+        // the remaining chunks (arm + drain). The controller has been
+        // clocking since IBI was acked, so each successive arm always
+        // makes forward progress.
         if !rest.is_empty() {
-            poll_fn(|cx| {
-                let _ = self.tx_dma.wait_cell().poll_wait(cx);
-                if self.tx_dma.is_done() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-
-            cortex_m::asm::dsb();
-
-            self.info
-                .regs()
-                .sdmactrl()
-                .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
-            unsafe {
-                self.tx_dma.disable_request();
-                self.tx_dma.clear_done();
+            let mut chunks = rest.chunks(DMA_MAX_TRANSFER_SIZE);
+            // First chunk was already armed before the IBI.
+            let _first = chunks.next();
+            self.dma_tx_drain_one().await;
+            for chunk in chunks {
+                self.dma_tx_arm(chunk)?;
+                self.dma_tx_drain_one().await;
             }
         }
 
@@ -974,29 +978,14 @@ impl<'d> I3c<'d> {
             regs_ptr.sdmactrl().modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
         });
 
-        if !rest.is_empty() {
-            self.dma_tx_arm(rest)?;
-
-            poll_fn(|cx| {
-                let _ = self.tx_dma.wait_cell().poll_wait(cx);
-                if self.tx_dma.is_done() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-
-            cortex_m::asm::dsb();
-
-            self.info
-                .regs()
-                .sdmactrl()
-                .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
-            unsafe {
-                self.tx_dma.disable_request();
-                self.tx_dma.clear_done();
-            }
+        // eDMA BITER/CITER are 15 bits, so a single descriptor caps at
+        // `DMA_MAX_TRANSFER_SIZE`. For larger payloads we arm + drain
+        // per chunk; the bus T=1 stream is unchanged because each chunk
+        // just keeps feeding `SWDATAB1` back-to-back. The final byte is
+        // SW-written to `SWDATABE` below to emit T=0.
+        for chunk in rest.chunks(DMA_MAX_TRANSFER_SIZE) {
+            self.dma_tx_arm(chunk)?;
+            self.dma_tx_drain_one().await;
         }
 
         self.wait_tx_space().await?;
@@ -1004,6 +993,33 @@ impl<'d> I3c<'d> {
 
         _drop.defuse();
         Ok(rest.len())
+    }
+
+    /// Await completion of the currently-armed TX DMA descriptor, then
+    /// disable the request channel and clear status. Used between
+    /// chunks of a larger logical TX so the next `dma_tx_arm` can
+    /// program a fresh descriptor without TCD overlap.
+    async fn dma_tx_drain_one(&mut self) {
+        poll_fn(|cx| {
+            let _ = self.tx_dma.wait_cell().poll_wait(cx);
+            if self.tx_dma.is_done() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        cortex_m::asm::dsb();
+
+        self.info
+            .regs()
+            .sdmactrl()
+            .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+        unsafe {
+            self.tx_dma.disable_request();
+            self.tx_dma.clear_done();
+        }
     }
 
     async fn wait_tx_space(&self) -> Result<(), IOError> {
@@ -1473,7 +1489,15 @@ impl BbqState {
         // I3C controller-write transaction). Ring must hold at least two
         // so the IRQ can re-arm into a fresh contiguous slot while the
         // consumer is still draining the previous one.
-        if max_rx_transaction == 0 || rx_buffer.len() < 2 * max_rx_transaction {
+        //
+        // `max_rx_transaction` must also fit in a single eDMA descriptor
+        // (BITER/CITER are 15 bits, so the cap is `DMA_MAX_TRANSFER_SIZE`).
+        // Without this guard, `start_read_transfer` would silently fail
+        // every IRQ rotation and the RX path would never make progress.
+        if max_rx_transaction == 0
+            || max_rx_transaction > DMA_MAX_TRANSFER_SIZE
+            || rx_buffer.len() < 2 * max_rx_transaction
+        {
             return Err(());
         }
         self.rx_grant_size.store(max_rx_transaction, Ordering::Release);
