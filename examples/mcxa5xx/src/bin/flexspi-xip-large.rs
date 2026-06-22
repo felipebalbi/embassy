@@ -42,7 +42,7 @@ mod flexspi_common;
 use flexspi_common::{FLASH_CONFIG, FLASH_PAGE_SIZE, FLASH_SECTOR_SIZE};
 
 /// FlexSPI AHB memory-mapped window base (secure alias; the core boots secure).
-const FLEXSPI_AMBA_BASE: u32 = 0x9000_0000;
+const FLEXSPI_AMBA_BASE: u32 = 0x8000_0000;
 /// Flash offset to host the routine (sector aligned, under the 16 MiB 3-byte
 /// address reach of the shared `FLASH_CONFIG` read sequence).
 const FLASH_OFFSET: u32 = 0x0040_0000;
@@ -52,7 +52,7 @@ const FLASH_OFFSET: u32 = 0x0040_0000;
 /// MUST stay in sync with the `.rept` count in the `global_asm!` block below.
 /// At ~12 bytes/round plus a small preamble this yields a multi-kilobyte blob
 /// spanning many flash pages.
-const KERNEL_ROUNDS: u32 = 256;
+const KERNEL_ROUNDS: u32 = 512;
 
 /// Mixing constants, shared between the asm kernel and [`kernel_reference`].
 const C1: u32 = 0x9E37_79B1;
@@ -80,7 +80,7 @@ core::arch::global_asm!(
     "movt r1, #0x9E37",
     "movw r2, #0xCA77",
     "movt r2, #0x85EB",
-    ".rept 256", // keep in sync with KERNEL_ROUNDS
+    ".rept 512", // keep in sync with KERNEL_ROUNDS
     "mul r0, r0, r1",
     "lsr r3, r0, #15",
     "eor r0, r0, r3",

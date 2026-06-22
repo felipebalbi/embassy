@@ -15,6 +15,16 @@ fn main() {
         .write_all(include_bytes!("memory.x"))
         .unwrap();
 
+    // Custom load-region fragment for the FlexSPI XIP example. Emitted next to
+    // memory.x (same search path) and applied only to that one bin via
+    // rustc-link-arg-bin, so other examples are unaffected.
+    File::create(out.join("xip.x"))
+        .unwrap()
+        .write_all(include_bytes!("xip.x"))
+        .unwrap();
+
     println!("cargo:rustc-link-search={}", out.display());
+    println!("cargo:rustc-link-arg-bin=flexspi-xip-linked=-Txip.x");
     println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=xip.x");
 }
