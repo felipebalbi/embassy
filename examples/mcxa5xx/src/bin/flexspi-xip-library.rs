@@ -35,14 +35,18 @@
 //! *executing from flash* against the value computed normally. A `HardFault`
 //! handler dumps fault status so an IBUSERR (CFSR bit 8) is unambiguous.
 
+use core::hint::black_box;
+
+use cortex_m::peripheral::DWT;
 use defmt::{error, info, warn, unwrap};
 use embassy_executor::Spawner;
-use embassy_time::{Instant, Timer};
+use embassy_time::Timer;
 use hal::clocks::config::{CoreSleep, FircConfig, FircFreqSel, MainClockSource, VddDriveStrength};
 use hal::clocks::periph_helpers::{Div4, FlexspiClockSel};
 use hal::clocks::{PoweredClock, VddLevel};
 use hal::config::Config;
 use hal::flexspi::{ClockConfig as FlexspiClockConfig, Flexspi, NorFlash};
+use hal::pac::flexspi::Clrahbrxbuf;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
 #[path = "../flexspi_common.rs"]
@@ -221,6 +225,22 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     loop {}
 }
 
+/// Invalidate the FlexSPI AHB read (prefetch) buffer so the *next* access to the
+/// XIP window re-fetches from external flash instead of returning data the
+/// controller already has resident -- i.e. force a **cold** read.
+///
+/// `AHBCR.CLRAHBRXBUF` is a level "enable clear" control (not self-clearing), so
+/// it is pulsed 1 -> 0: while asserted the buffer is flushed, and deasserting it
+/// resumes normal buffering starting from empty. The `dsb` ensures the flush has
+/// landed before the caller starts timing.
+#[inline(never)]
+fn invalidate_flexspi_read_cache() {
+    let ahbcr = hal::pac::FLEXSPI0.ahbcr();
+    ahbcr.modify(|w| w.set_clrahbrxbuf(Clrahbrxbuf::Val1));
+    ahbcr.modify(|w| w.set_clrahbrxbuf(Clrahbrxbuf::Val0));
+    cortex_m::asm::dsb();
+}
+
 /// Build a [`Config`] that locks the core to 192 MHz (over-drive) with deep
 /// sleep disabled.
 fn max_clock_config() -> Config {
@@ -250,13 +270,23 @@ fn max_clock_config() -> Config {
 async fn main(_spawner: Spawner) {
     let p = hal::init(max_clock_config());
 
+    // Enable the DWT cycle counter (CYCCNT) for cycle-accurate timing. At the
+    // 192 MHz core clock one cycle is ~5.21 ns, far finer than embassy_time's
+    // 1 us OSTIMER tick. Steal the core peripherals: hal::init already took them,
+    // but DWT/DCB are otherwise unused here.
+    let mut cp = unsafe { cortex_m::Peripherals::steal() };
+    cp.DCB.enable_trace();
+    cp.DWT.enable_cycle_counter();
+
     // info!("FlexSPI XIP library example: core 192 MHz, FlexSPI 192 MHz Quad I/O");
 
-    let div = 3;
+    // FlexSPI serial-clock divider, swept to benchmark XIP performance vs flash
+    // frequency. Sourced from the 192 MHz FRO_HF, so the serial clock is
+    // 192/div MHz: div=1 -> 192, 2 -> 96, 3 -> 64, 4 -> 48 MHz. The W25Q64JV does
+    // Quad I/O up to 133 MHz and the FlexSPI block goes higher still (240 MHz SD /
+    // 320 MHz OD), so the divider -- not the parts -- sets the rate here.
+    let div = 1;
 
-    // FlexSPI sourced from the 192 MHz FRO_HF, divided by 3 => 64 MHz SDR serial
-    // clock -- the highest integer-divisor rate within the W25Q64JV's 80 MHz
-    // Quad I/O limit on this board.
     let flexspi_clock = FlexspiClockConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexspiClockSel::FroHf,
@@ -336,21 +366,39 @@ async fn main(_spawner: Spawner) {
     let entry: XipEntryFn = unsafe { core::mem::transmute(entry_addr) };
 
     let seed: u32 = 0xC0FF_EE00;
+    let want = reference_digest(seed);
+    let freq_mhz = 192 / div;
 
-    for _ in 1..10 {
-        let start = Instant::now();
-        let got = entry(seed);
-        let elapsed = start.elapsed();
-        let want = reference_digest(seed);
+    // Benchmark each iteration twice: a COLD call (FlexSPI AHB read buffer
+    // invalidated first, so code + table are re-fetched from external flash) and
+    // a WARM call immediately after (buffer now populated by the cold run). The
+    // gap between the two isolates the controller's read-buffer/prefetch effect.
+    //
+    // Timing is in CPU cycles via DWT::cycle_count() (CYCCNT wraps every ~22 s at
+    // 192 MHz; the measured regions are << that, so wrapping_sub is exact). Output
+    // is CSV: `flexspi_mhz,cold_cycles,warm_cycles`.
+    for _ in 0..100 {
+        invalidate_flexspi_read_cache();
+        let t0 = DWT::cycle_count();
+        let got_cold = entry(black_box(seed));
+        let cold = DWT::cycle_count().wrapping_sub(t0);
+        black_box(got_cold);
 
-        if got == want {
-            // info!("XIP library PASSED: 0x{=u32:08x} == reference (executed + read tables from flash)", got);
-            warn!("{},{}", 192/div, elapsed.as_nanos());
+        let t0 = DWT::cycle_count();
+        let got_warm = entry(black_box(seed));
+        let warm = DWT::cycle_count().wrapping_sub(t0);
+        black_box(got_warm);
+
+        if got_cold != want || got_warm != want {
+            error!(
+                "XIP library WRONG result: cold=0x{=u32:08x} warm=0x{=u32:08x} != reference 0x{=u32:08x}",
+                got_cold, got_warm, want
+            );
         } else {
-            error!("XIP library WRONG result: 0x{=u32:08x} != reference 0x{=u32:08x}", got, want);
+            warn!("{},{},{}", freq_mhz, cold, warm);
         }
 
-        Timer::after_millis(100).await;
+        Timer::after_millis(50).await;
     }
 
     loop {
