@@ -23,8 +23,18 @@ fn main() {
         .write_all(include_bytes!("xip.x"))
         .unwrap();
 
+    // Load-region fragment for the FlexSPI XIP *library* example. Like xip.x but
+    // also relocates `.xip_rodata`, so a whole mini-library (code + lookup
+    // tables) lives entirely in external flash. Applied only to that one bin.
+    File::create(out.join("xip-lib.x"))
+        .unwrap()
+        .write_all(include_bytes!("xip-lib.x"))
+        .unwrap();
+
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rustc-link-arg-bin=flexspi-xip-linked=-Txip.x");
+    println!("cargo:rustc-link-arg-bin=flexspi-xip-library=-Txip-lib.x");
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=xip.x");
+    println!("cargo:rerun-if-changed=xip-lib.x");
 }
