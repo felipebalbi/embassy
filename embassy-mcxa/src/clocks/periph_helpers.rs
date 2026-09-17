@@ -348,9 +348,9 @@ impl DacConfig {
             VddLevel::NormalMode | VddLevel::OverDriveMode => 64_000_000,
         };
 
-        // Compare exactly: `freq / div` would floor and let a marginally
-        // over-limit clock pass. `div` is 1..=16 so this cannot overflow u32.
-        if freq > fmax * div {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "dac fclk",
                 reason: "exceeds max rating",
@@ -513,7 +513,6 @@ impl AdcConfig {
 
         // Check clock speed is reasonable
         let div = self.div.into_divisor();
-        let expected = freq / div;
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         let power = match self.power {
             PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
@@ -521,18 +520,20 @@ impl AdcConfig {
         };
 
         #[cfg(feature = "mcxa2xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 24_000_000,
             VddLevel::OverDriveMode => 64_000_000,
         };
 
         #[cfg(feature = "mcxa5xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 24_000_000,
             VddLevel::NormalMode | VddLevel::OverDriveMode => 64_000_000,
         };
 
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "adc fclk",
                 reason: "exceeds max rating",
@@ -791,7 +792,6 @@ impl LpspiConfig {
         };
 
         let div = self.div.into_divisor();
-        let expected = freq / div;
 
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         let power = match self.power {
@@ -800,19 +800,21 @@ impl LpspiConfig {
         };
 
         #[cfg(feature = "mcxa2xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 50_000_000,
             VddLevel::OverDriveMode => 100_000_000,
         };
 
         #[cfg(feature = "mcxa5xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 50_000_000,
             VddLevel::NormalMode => 150_000_000,
             VddLevel::OverDriveMode => 200_000_000,
         };
 
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "lpspi fclk",
                 reason: "exceeds max rating",
@@ -959,20 +961,21 @@ impl FlexspiConfig {
         };
 
         let div = self.div.into_divisor();
-        let expected = freq / div;
         // Peripheral clock max functional clock limits: MCXA5xx 28.3.2
         let power = match self.power {
             PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
             PoweredClock::AlwaysEnabled => clocks.lp_power,
         };
 
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 96_000_000,
             VddLevel::NormalMode => 240_000_000,
             VddLevel::OverDriveMode => 320_000_000,
         };
 
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "flexspi fclk",
                 reason: "exceeds max rating",
@@ -1100,9 +1103,10 @@ impl I3cConfig {
         };
 
         let div = self.div.into_divisor();
-        let expected = freq / div;
 
-        if expected > I3C_FCLK_MAX {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (I3C_FCLK_MAX as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "i3c fclk",
                 reason: "exceeds max rating",
@@ -1271,7 +1275,6 @@ impl Lpi2cConfig {
         };
 
         let div = self.div.into_divisor();
-        let expected = freq / div;
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         let power = match self.power {
             PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
@@ -1279,18 +1282,20 @@ impl Lpi2cConfig {
         };
 
         #[cfg(feature = "mcxa2xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 25_000_000,
             VddLevel::OverDriveMode => 60_000_000,
         };
 
         #[cfg(feature = "mcxa5xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 25_000_000,
             VddLevel::NormalMode | VddLevel::OverDriveMode => 64_000_000,
         };
 
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "lpi2c fclk",
                 reason: "exceeds max rating",
@@ -1458,24 +1463,25 @@ impl LpuartConfig {
 
         // Check clock speed is reasonable
         let div = self.div.into_divisor();
-        let expected = freq / div;
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         let power = match self.power {
             PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
             PoweredClock::AlwaysEnabled => clocks.lp_power,
         };
         #[cfg(feature = "mcxa2xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 45_000_000,
             VddLevel::OverDriveMode => 180_000_000,
         };
         #[cfg(feature = "mcxa5xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 50_000_000,
             VddLevel::NormalMode => 150_000_000,
             VddLevel::OverDriveMode => 200_000_000,
         };
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "lpuart fclk",
                 reason: "exceeds max rating",
@@ -1667,7 +1673,6 @@ impl CTimerConfig {
         };
 
         let div = self.div.into_divisor();
-        let expected = freq / div;
 
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         let power = match self.power {
@@ -1675,18 +1680,20 @@ impl CTimerConfig {
             PoweredClock::AlwaysEnabled => clocks.lp_power,
         };
         #[cfg(feature = "mcxa2xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 90_000_000,
             VddLevel::OverDriveMode => 180_000_000,
         };
         #[cfg(feature = "mcxa5xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 50_000_000,
             VddLevel::NormalMode => 150_000_000,
             VddLevel::OverDriveMode => 200_000_000,
         };
 
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "ctimer fclk",
                 reason: "exceeds max rating",
@@ -1861,25 +1868,26 @@ impl CanConfig {
         // peripheral clock max functional clock limits: MCXA2xx 21.3.2 (p. 845),
         // MCXA5xx 28.3.2 (p. 1273).
         let div = self.div.into_divisor();
-        let expected = freq / div;
         let power = match self.power {
             PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
             PoweredClock::AlwaysEnabled => clocks.lp_power,
         };
 
         #[cfg(feature = "mcxa2xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 45_000_000,
             VddLevel::OverDriveMode => 90_000_000,
         };
 
         #[cfg(feature = "mcxa5xx")]
-        let fmax = match power {
+        let fmax: u32 = match power {
             VddLevel::MidDriveMode => 50_000_000,
             VddLevel::NormalMode | VddLevel::OverDriveMode => 100_000_000,
         };
 
-        if expected > fmax {
+        // Compare exactly without overflowing: the post-divider frequency
+        // exceeds fmax exactly when `freq > fmax * div`.
+        if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "flexcan fclk",
                 reason: "exceeds max rating",
