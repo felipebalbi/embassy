@@ -95,17 +95,24 @@ pub unsafe fn enable<G: Gate>(cfg: &G::MrccPeriphConfig) -> Result<PreEnablePart
         // Instead of checking, just disable the clock if it is currently enabled.
         G::disable_clock();
 
-        let freq = critical_section::with(|cs| {
+        let parts = critical_section::with(|cs| {
             let clocks = CLOCKS.borrow_ref(cs);
-            let clocks = clocks.as_ref().ok_or(ClockError::NeverInitialized)?;
-            cfg.pre_enable_config(clocks)
+            let clocks = match clocks.as_ref() {
+                Some(clocks) => clocks,
+                None => return Err(ClockError::NeverInitialized),
+            };
+            let freq = match cfg.validate(clocks) {
+                Ok(freq) => freq,
+                Err(err) => return Err(err),
+            };
+            Ok(cfg.apply(freq))
         })?;
 
         G::enable_clock();
         while !G::is_clock_enabled() {}
         core::arch::asm!("dsb sy; isb sy", options(nomem, nostack, preserves_flags));
 
-        Ok(freq)
+        Ok(parts)
     }
 }
 

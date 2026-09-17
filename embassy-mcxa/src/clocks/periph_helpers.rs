@@ -46,6 +46,8 @@ impl PreEnableParts {
 /// provide the methods that will be called by the higher level operations like
 /// `embassy_mcxa::clocks::enable_and_reset()`.
 pub trait SPConfHelper {
+    /// Pure validation. Must not access registers or acquire a [`WakeGuard`].
+    ///
     /// This method is called AFTER a given MRCC peripheral has been disabled, and BEFORE
     /// the peripheral is to be enabled.
     ///
@@ -59,8 +61,21 @@ pub trait SPConfHelper {
     /// This function WILL be called in a critical section, care should be taken not to delay
     /// for an unreasonable amount of time.
     ///
-    /// On success, this function MUST return an `Ok(parts)`.
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError>;
+    /// On success, this function MUST return an `Ok(freq)`, the frequency of the selected
+    /// source clock, BEFORE any peripheral pre-divisor is applied.
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError>;
+
+    /// Apply an already-validated configuration.
+    ///
+    /// Called only after `validate` succeeds and while the peripheral gate
+    /// remains disabled.
+    ///
+    /// This function SHOULD NOT make any changes to the system clock configuration, even
+    /// unsafely, as this should remain static for the duration of the program.
+    ///
+    /// This function WILL be called in a critical section, care should be taken not to delay
+    /// for an unreasonable amount of time.
+    fn apply(&self, freq: u32) -> PreEnableParts;
 }
 
 /// Copy and paste macro that:
@@ -69,7 +84,7 @@ pub trait SPConfHelper {
 /// * Resets and halts the div, and applies the calculated div4 bits
 /// * Releases reset + halt
 /// * Waits for the div to stabilize
-/// * Returns `Ok($freq / $conf.div.into_divisor())`
+/// * Returns `$freq / $conf.div.into_divisor()`
 ///
 /// Assumes:
 ///
@@ -107,10 +122,10 @@ macro_rules! apply_div4 {
 
         while $divreg.read().unstab() == ClkdivUnstab::Off {}
 
-        Ok(PreEnableParts {
+        PreEnableParts {
             freq: $freq / $conf.div.into_divisor(),
             wake_guard: WakeGuard::for_power(&$conf.power),
-        })
+        }
     }};
 }
 
@@ -175,9 +190,21 @@ impl Div4 {
 /// Should only be used as a placeholder.
 pub struct UnimplementedConfig;
 
-impl SPConfHelper for UnimplementedConfig {
-    fn pre_enable_config(&self, _clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+impl UnimplementedConfig {
+    fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
         Err(ClockError::UnimplementedConfig)
+    }
+}
+
+impl SPConfHelper for UnimplementedConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        UnimplementedConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, _freq: u32) -> PreEnableParts {
+        // Unreachable in practice: `validate` always fails, so the gate never
+        // calls `apply`. Must not panic.
+        PreEnableParts::empty()
     }
 }
 
@@ -186,9 +213,20 @@ impl SPConfHelper for UnimplementedConfig {
 /// This should only be used for peripherals that are "ambiently" clocked, like `PORTn`
 /// peripherals, which have no selectable/configurable source clock.
 pub struct NoConfig;
+
+impl NoConfig {
+    fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
+        Ok(0)
+    }
+}
+
 impl SPConfHelper for NoConfig {
-    fn pre_enable_config(&self, _clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        Ok(PreEnableParts::empty())
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        NoConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, _freq: u32) -> PreEnableParts {
+        PreEnableParts::empty()
     }
 }
 
@@ -198,12 +236,20 @@ impl SPConfHelper for NoConfig {
 /// the CLK1M clock and have no other selectable/configurable source
 /// clock.
 pub struct Clk1MConfig;
+
+impl Clk1MConfig {
+    fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
+        Ok(1_000_000)
+    }
+}
+
 impl SPConfHelper for Clk1MConfig {
-    fn pre_enable_config(&self, _clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        Ok(PreEnableParts {
-            freq: 1_000_000,
-            wake_guard: None,
-        })
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        Clk1MConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        PreEnableParts { freq, wake_guard: None }
     }
 }
 
@@ -254,88 +300,31 @@ pub struct DacConfig {
     pub(crate) instance: DacInstance,
 }
 
-impl SPConfHelper for DacConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clksel, clkdiv) = match self.instance {
-            DacInstance::Dac0 => (mrcc0.mrcc_dac0_clksel(), mrcc0.mrcc_dac0_clkdiv()),
-            #[cfg(feature = "mcxa5xx")]
-            DacInstance::Dac1 => (mrcc0.mrcc_dac1_clksel(), mrcc0.mrcc_dac1_clkdiv()),
-        };
-
-        // Mux encodings: MCXA5xx 22.5.2.89 (DAC0) / 22.5.2.91 (DAC1),
-        // MCXA2xx 14.5.2.66 (DAC0). All three are identical. NOTE that mux
-        // value 2 is `FRO_HF_DIV` (divided) and mux value 6 is `PLL1_CLK_DIV`
-        // (divided) - this differs from the ADC mux, do not copy that one.
-        let (freq, variant) = match self.source {
-            DacClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = DacClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = DacClkselMux::I0ClkrootFunc0;
-
-                (freq, mux)
-            }
-            DacClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = DacClkselMux::ClkrootFunc2;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = DacClkselMux::I2ClkrootFunc2;
-
-                (freq, mux)
-            }
+impl DacConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        let freq = match self.source {
+            DacClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            DacClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(not(feature = "sosc-as-gpio"))]
-            DacClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = DacClkselMux::ClkrootFunc3;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = DacClkselMux::I3ClkrootFunc3;
-
-                (freq, mux)
-            }
-            DacClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = DacClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = DacClkselMux::I5ClkrootFunc5;
-
-                (freq, mux)
-            }
-            DacClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = DacClkselMux::ClkrootFunc6;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = DacClkselMux::I6ClkrootFunc6;
-
-                (freq, mux)
-            }
-            DacClockSel::None => {
-                clksel.write(|w| w.set_mux(DacClkselMux::_RESERVED_7));
-                // PAC enum names are inverted: `Off` is the asserted (1) state.
-                // HALT=1 stops the divider, RESET=1 holds it in reset, matching
-                // the CLKDIV reset value of 0x4000_0000.
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::Off);
-                    w.set_halt(ClkdivHalt::Off);
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            DacClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            DacClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            DacClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            DacClockSel::None => return Ok(0),
         };
 
         // Check clock speed is reasonable
@@ -367,6 +356,88 @@ impl SPConfHelper for DacConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for DacConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        DacConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clksel, clkdiv) = match self.instance {
+            DacInstance::Dac0 => (mrcc0.mrcc_dac0_clksel(), mrcc0.mrcc_dac0_clkdiv()),
+            #[cfg(feature = "mcxa5xx")]
+            DacInstance::Dac1 => (mrcc0.mrcc_dac1_clksel(), mrcc0.mrcc_dac1_clkdiv()),
+        };
+
+        // Mux encodings: MCXA5xx 22.5.2.89 (DAC0) / 22.5.2.91 (DAC1),
+        // MCXA2xx 14.5.2.66 (DAC0). All three are identical. NOTE that mux
+        // value 2 is `FRO_HF_DIV` (divided) and mux value 6 is `PLL1_CLK_DIV`
+        // (divided) - this differs from the ADC mux, do not copy that one.
+        let variant = match self.source {
+            DacClockSel::FroLfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = DacClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = DacClkselMux::I0ClkrootFunc0;
+
+                mux
+            }
+            DacClockSel::FroHfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = DacClkselMux::ClkrootFunc2;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = DacClkselMux::I2ClkrootFunc2;
+
+                mux
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            DacClockSel::ClkIn => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = DacClkselMux::ClkrootFunc3;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = DacClkselMux::I3ClkrootFunc3;
+
+                mux
+            }
+            DacClockSel::Clk1M => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = DacClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = DacClkselMux::I5ClkrootFunc5;
+
+                mux
+            }
+            DacClockSel::Pll1ClkDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = DacClkselMux::ClkrootFunc6;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = DacClkselMux::I6ClkrootFunc6;
+
+                mux
+            }
+            DacClockSel::None => {
+                clksel.write(|w| w.set_mux(DacClkselMux::_RESERVED_7));
+                // PAC enum names are inverted: `Off` is the asserted (1) state.
+                // HALT=1 stops the divider, RESET=1 holds it in reset, matching
+                // the CLKDIV reset value of 0x4000_0000.
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::Off);
+                    w.set_halt(ClkdivHalt::Off);
+                });
+                return PreEnableParts::empty();
+            }
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
@@ -408,78 +479,37 @@ pub struct AdcConfig {
     pub div: Div4,
 }
 
-impl SPConfHelper for AdcConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (freq, variant) = match self.source {
-            AdcClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = AdcClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = AdcClkselMux::I0ClkrootSircDiv;
-
-                (freq, mux)
-            }
-            AdcClockSel::FroHf => {
-                let freq = clocks.ensure_fro_hf_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = AdcClkselMux::ClkrootFunc1;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = AdcClkselMux::I1ClkrootFircGated;
-
-                (freq, mux)
-            }
+impl AdcConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        let freq = match self.source {
+            AdcClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            AdcClockSel::FroHf => match clocks.ensure_fro_hf_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(not(feature = "sosc-as-gpio"))]
-            AdcClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = AdcClkselMux::ClkrootFunc3;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = AdcClkselMux::I3ClkrootSosc;
-
-                (freq, mux)
-            }
+            AdcClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             // #[cfg(feature = "mcxa5xx")]
-            // AdcClockSel::UsbPllClk => {
-            //     let freq = clocks.ensure_usb_pll_clk_active(&self.power)?;
-            //     let mux = AdcClkselMux::I4_CLKROOT_USBPFD;
-            //     (freq, mux)
-            // }
-            AdcClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = AdcClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = AdcClkselMux::I5Clkroot1m;
-
-                (freq, mux)
-            }
-            AdcClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = AdcClkselMux::ClkrootFunc6;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = AdcClkselMux::I6ClkrootSpllDiv;
-
-                (freq, mux)
-            }
-            AdcClockSel::None => {
-                mrcc0.mrcc_adc_clksel().write(|w| {
-                    // no ClkrootFunc7, just write manually for now
-                    w.set_mux(AdcClkselMux::_RESERVED_7)
-                });
-                mrcc0.mrcc_adc_clkdiv().modify(|w| {
-                    w.set_reset(ClkdivReset::On);
-                    w.set_halt(ClkdivHalt::On);
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            // AdcClockSel::UsbPllClk => match clocks.ensure_usb_pll_clk_active(&self.power) {
+            //     Ok(freq) => freq,
+            //     Err(e) => return Err(e),
+            // },
+            AdcClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            AdcClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            AdcClockSel::None => return Ok(0),
         };
-        let clksel = mrcc0.mrcc_adc_clksel();
-        let clkdiv = mrcc0.mrcc_adc_clkdiv();
 
         // Check clock speed is reasonable
         let div = self.div.into_divisor();
@@ -509,6 +539,78 @@ impl SPConfHelper for AdcConfig {
             });
         }
 
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for AdcConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        AdcConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let variant = match self.source {
+            AdcClockSel::FroLfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = AdcClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = AdcClkselMux::I0ClkrootSircDiv;
+
+                mux
+            }
+            AdcClockSel::FroHf => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = AdcClkselMux::ClkrootFunc1;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = AdcClkselMux::I1ClkrootFircGated;
+
+                mux
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            AdcClockSel::ClkIn => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = AdcClkselMux::ClkrootFunc3;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = AdcClkselMux::I3ClkrootSosc;
+
+                mux
+            }
+            // #[cfg(feature = "mcxa5xx")]
+            // AdcClockSel::UsbPllClk => AdcClkselMux::I4_CLKROOT_USBPFD,
+            AdcClockSel::Clk1M => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = AdcClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = AdcClkselMux::I5Clkroot1m;
+
+                mux
+            }
+            AdcClockSel::Pll1ClkDiv => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = AdcClkselMux::ClkrootFunc6;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = AdcClkselMux::I6ClkrootSpllDiv;
+
+                mux
+            }
+            AdcClockSel::None => {
+                mrcc0.mrcc_adc_clksel().write(|w| {
+                    // no ClkrootFunc7, just write manually for now
+                    w.set_mux(AdcClkselMux::_RESERVED_7)
+                });
+                mrcc0.mrcc_adc_clkdiv().modify(|w| {
+                    w.set_reset(ClkdivReset::On);
+                    w.set_halt(ClkdivHalt::On);
+                });
+                return PreEnableParts::empty();
+            }
+        };
+        let clksel = mrcc0.mrcc_adc_clksel();
+        let clkdiv = mrcc0.mrcc_adc_clkdiv();
+
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
 }
@@ -536,13 +638,33 @@ pub struct OsTimerConfig {
     pub source: OstimerClockSel,
 }
 
-impl SPConfHelper for OsTimerConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        let mrcc0 = crate::pac::MRCC0;
+impl OsTimerConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // NOTE: complies with the peripheral clock max functional clock limits
         // (MCXA2xx 21.3.2, MCXA5xx 28.3.2), which is 1MHz, and we can only
         // select 1mhz/16khz.
-        Ok(match self.source {
+        match self.source {
+            OstimerClockSel::Clk16kVddCore => match clocks.ensure_clk_16k_vdd_core_active(&self.power) {
+                Ok(freq) => Ok(freq),
+                Err(e) => Err(e),
+            },
+            OstimerClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => Ok(freq),
+                Err(e) => Err(e),
+            },
+            OstimerClockSel::None => Ok(0),
+        }
+    }
+}
+
+impl SPConfHelper for OsTimerConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        OsTimerConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+        match self.source {
             OstimerClockSel::Clk16kVddCore => {
                 // TODO: fix PAC names for consistency
                 #[cfg(feature = "mcxa2xx")]
@@ -550,7 +672,6 @@ impl SPConfHelper for OsTimerConfig {
                 #[cfg(feature = "mcxa5xx")]
                 let mux = OstimerClkselMux::I0Clkroot16k;
 
-                let freq = clocks.ensure_clk_16k_vdd_core_active(&self.power)?;
                 mrcc0.mrcc_ostimer0_clksel().write(|w| w.set_mux(mux));
                 PreEnableParts {
                     freq,
@@ -558,7 +679,6 @@ impl SPConfHelper for OsTimerConfig {
                 }
             }
             OstimerClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
                 // TODO: fix PAC names for consistency
                 #[cfg(feature = "mcxa2xx")]
                 let mux = OstimerClkselMux::Clkroot1m;
@@ -577,7 +697,7 @@ impl SPConfHelper for OsTimerConfig {
                     .write(|w| w.set_mux(OstimerClkselMux::_RESERVED_3));
                 PreEnableParts::empty()
             }
-        })
+        }
     }
 }
 
@@ -642,90 +762,32 @@ pub struct LpspiConfig {
     pub(crate) instance: LpspiInstance,
 }
 
-impl SPConfHelper for LpspiConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+impl LpspiConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            LpspiInstance::Lpspi0 => (mrcc0.mrcc_lpspi0_clkdiv(), mrcc0.mrcc_lpspi0_clksel()),
-            LpspiInstance::Lpspi1 => (mrcc0.mrcc_lpspi1_clkdiv(), mrcc0.mrcc_lpspi1_clksel()),
-            #[cfg(feature = "mcxa5xx")]
-            LpspiInstance::Lpspi2 => (mrcc0.mrcc_lpspi2_clkdiv(), mrcc0.mrcc_lpspi2_clksel()),
-            #[cfg(feature = "mcxa5xx")]
-            LpspiInstance::Lpspi3 => (mrcc0.mrcc_lpspi3_clkdiv(), mrcc0.mrcc_lpspi3_clksel()),
-            #[cfg(feature = "mcxa5xx")]
-            LpspiInstance::Lpspi4 => (mrcc0.mrcc_lpspi4_clkdiv(), mrcc0.mrcc_lpspi4_clksel()),
-            #[cfg(feature = "mcxa5xx")]
-            LpspiInstance::Lpspi5 => (mrcc0.mrcc_lpspi5_clkdiv(), mrcc0.mrcc_lpspi5_clksel()),
-        };
-
-        let (freq, variant) = match self.source {
-            LpspiClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpspiClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpspiClkselMux::I0ClkrootFunc0;
-
-                (freq, mux)
-            }
-            LpspiClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpspiClkselMux::ClkrootFunc2;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpspiClkselMux::I2ClkrootFunc2;
-
-                (freq, mux)
-            }
+        let freq = match self.source {
+            LpspiClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpspiClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(not(feature = "sosc-as-gpio"))]
-            LpspiClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpspiClkselMux::ClkrootFunc3;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpspiClkselMux::I3ClkrootFunc3;
-
-                (freq, mux)
-            }
-            LpspiClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpspiClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpspiClkselMux::I5ClkrootFunc5;
-
-                (freq, mux)
-            }
-            LpspiClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpspiClkselMux::ClkrootFunc6;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpspiClkselMux::I6ClkrootFunc6;
-
-                (freq, mux)
-            }
-            LpspiClockSel::None => {
-                // no ClkrootFunc7, just write manually for now
-                clksel.write(|w| w.0 = 0b111);
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::Off);
-                    w.set_halt(ClkdivHalt::Off);
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            LpspiClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpspiClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpspiClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpspiClockSel::None => return Ok(0),
         };
 
         let div = self.div.into_divisor();
@@ -756,6 +818,89 @@ impl SPConfHelper for LpspiConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for LpspiConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        LpspiConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            LpspiInstance::Lpspi0 => (mrcc0.mrcc_lpspi0_clkdiv(), mrcc0.mrcc_lpspi0_clksel()),
+            LpspiInstance::Lpspi1 => (mrcc0.mrcc_lpspi1_clkdiv(), mrcc0.mrcc_lpspi1_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            LpspiInstance::Lpspi2 => (mrcc0.mrcc_lpspi2_clkdiv(), mrcc0.mrcc_lpspi2_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            LpspiInstance::Lpspi3 => (mrcc0.mrcc_lpspi3_clkdiv(), mrcc0.mrcc_lpspi3_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            LpspiInstance::Lpspi4 => (mrcc0.mrcc_lpspi4_clkdiv(), mrcc0.mrcc_lpspi4_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            LpspiInstance::Lpspi5 => (mrcc0.mrcc_lpspi5_clkdiv(), mrcc0.mrcc_lpspi5_clksel()),
+        };
+
+        let variant = match self.source {
+            LpspiClockSel::FroLfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpspiClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpspiClkselMux::I0ClkrootFunc0;
+
+                mux
+            }
+            LpspiClockSel::FroHfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpspiClkselMux::ClkrootFunc2;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpspiClkselMux::I2ClkrootFunc2;
+
+                mux
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            LpspiClockSel::ClkIn => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpspiClkselMux::ClkrootFunc3;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpspiClkselMux::I3ClkrootFunc3;
+
+                mux
+            }
+            LpspiClockSel::Clk1M => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpspiClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpspiClkselMux::I5ClkrootFunc5;
+
+                mux
+            }
+            LpspiClockSel::Pll1ClkDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpspiClkselMux::ClkrootFunc6;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpspiClkselMux::I6ClkrootFunc6;
+
+                mux
+            }
+            LpspiClockSel::None => {
+                // no ClkrootFunc7, just write manually for now
+                clksel.write(|w| w.0 = 0b111);
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::Off);
+                    w.set_halt(ClkdivHalt::Off);
+                });
+                return PreEnableParts::empty();
+            }
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
@@ -800,23 +945,17 @@ pub struct FlexspiConfig {
 }
 
 #[cfg(feature = "mcxa5xx")]
-impl SPConfHelper for FlexspiConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            FlexspiInstance::Flexspi0 => (mrcc0.mrcc_flexspi0_clkdiv(), mrcc0.mrcc_flexspi0_clksel()),
-        };
-
-        let (freq, variant) = match self.source {
-            FlexspiClockSel::FroHf => (
-                clocks.ensure_fro_hf_active(&self.power)?,
-                FlexspiClkselMux::I1ClkrootFircGated,
-            ),
-            FlexspiClockSel::Pll1Clk => (
-                clocks.ensure_pll1_clk_active(&self.power)?,
-                FlexspiClkselMux::I6ClkrootSpll,
-            ),
+impl FlexspiConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        let freq = match self.source {
+            FlexspiClockSel::FroHf => match clocks.ensure_fro_hf_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            FlexspiClockSel::Pll1Clk => match clocks.ensure_pll1_clk_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
         };
 
         let div = self.div.into_divisor();
@@ -839,6 +978,28 @@ impl SPConfHelper for FlexspiConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+#[cfg(feature = "mcxa5xx")]
+impl SPConfHelper for FlexspiConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        FlexspiConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            FlexspiInstance::Flexspi0 => (mrcc0.mrcc_flexspi0_clkdiv(), mrcc0.mrcc_flexspi0_clksel()),
+        };
+
+        let variant = match self.source {
+            FlexspiClockSel::FroHf => FlexspiClkselMux::I1ClkrootFircGated,
+            FlexspiClockSel::Pll1Clk => FlexspiClkselMux::I6ClkrootSpll,
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
@@ -900,8 +1061,8 @@ pub struct I3cConfig {
     pub(crate) instance: I3cInstance,
 }
 
-impl SPConfHelper for I3cConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+impl I3cConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         #[cfg(feature = "mcxa2xx")]
         // Always 25MHz maximum frequency.
@@ -912,6 +1073,52 @@ impl SPConfHelper for I3cConfig {
         const I3C_FCLK_MAX: u32 = 100_000_000;
 
         // check that source is suitable
+        let freq = match self.source {
+            I3cClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            I3cClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            I3cClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            I3cClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            #[cfg(feature = "mcxa5xx")]
+            I3cClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            I3cClockSel::None => return Ok(0),
+        };
+
+        let div = self.div.into_divisor();
+        let expected = freq / div;
+
+        if expected > I3C_FCLK_MAX {
+            return Err(ClockError::BadConfig {
+                clock: "i3c fclk",
+                reason: "exceeds max rating",
+            });
+        }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for I3cConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        I3cConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
         let mrcc0 = crate::pac::MRCC0;
 
         let (clkdiv, clksel) = match self.instance {
@@ -924,51 +1131,42 @@ impl SPConfHelper for I3cConfig {
             I3cInstance::I3c3 => (mrcc0.mrcc_i3c3_fclk_clkdiv(), mrcc0.mrcc_i3c3_fclk_clksel()),
         };
 
-        let (freq, variant) = match self.source {
+        let variant = match self.source {
             I3cClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
                 #[cfg(feature = "mcxa2xx")]
                 let mux = FclkClkselMux::ClkrootFunc0;
                 #[cfg(feature = "mcxa5xx")]
                 let mux = FclkClkselMux::I0ClkrootFunc0;
 
-                (freq, mux)
+                mux
             }
             I3cClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
                 #[cfg(feature = "mcxa2xx")]
                 let mux = FclkClkselMux::ClkrootFunc2;
                 #[cfg(feature = "mcxa5xx")]
                 let mux = FclkClkselMux::I2ClkrootFunc2;
 
-                (freq, mux)
+                mux
             }
             #[cfg(not(feature = "sosc-as-gpio"))]
             I3cClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
                 #[cfg(feature = "mcxa2xx")]
                 let mux = FclkClkselMux::ClkrootFunc3;
                 #[cfg(feature = "mcxa5xx")]
                 let mux = FclkClkselMux::I3ClkrootFunc3;
 
-                (freq, mux)
+                mux
             }
             I3cClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
                 #[cfg(feature = "mcxa2xx")]
                 let mux = FclkClkselMux::ClkrootFunc5;
                 #[cfg(feature = "mcxa5xx")]
                 let mux = FclkClkselMux::I5ClkrootFunc5;
 
-                (freq, mux)
+                mux
             }
             #[cfg(feature = "mcxa5xx")]
-            I3cClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-                let mux = FclkClkselMux::I6ClkrootFunc6;
-
-                (freq, mux)
-            }
+            I3cClockSel::Pll1ClkDiv => FclkClkselMux::I6ClkrootFunc6,
             I3cClockSel::None => {
                 // no ClkrootFunc7, just write manually for now
                 clksel.write(|w| w.0 = 0b111);
@@ -976,19 +1174,9 @@ impl SPConfHelper for I3cConfig {
                     w.set_reset(ClkdivReset::Off);
                     w.set_halt(ClkdivHalt::Off);
                 });
-                return Ok(PreEnableParts::empty());
+                return PreEnableParts::empty();
             }
         };
-
-        let div = self.div.into_divisor();
-        let expected = freq / div;
-
-        if expected > I3C_FCLK_MAX {
-            return Err(ClockError::BadConfig {
-                clock: "i3c fclk",
-                reason: "exceeds max rating",
-            });
-        }
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
@@ -1052,69 +1240,36 @@ pub struct Lpi2cConfig {
     pub(crate) instance: Lpi2cInstance,
 }
 
-impl SPConfHelper for Lpi2cConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+impl Lpi2cConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            Lpi2cInstance::Lpi2c0 => (mrcc0.mrcc_lpi2c0_clkdiv(), mrcc0.mrcc_lpi2c0_clksel()),
-            Lpi2cInstance::Lpi2c1 => (mrcc0.mrcc_lpi2c1_clkdiv(), mrcc0.mrcc_lpi2c1_clksel()),
-            Lpi2cInstance::Lpi2c2 => (mrcc0.mrcc_lpi2c2_clkdiv(), mrcc0.mrcc_lpi2c2_clksel()),
-            Lpi2cInstance::Lpi2c3 => (mrcc0.mrcc_lpi2c3_clkdiv(), mrcc0.mrcc_lpi2c3_clksel()),
-            #[cfg(feature = "mcxa5xx")]
-            Lpi2cInstance::Lpi2c4 => (mrcc0.mrcc_lpi2c4_clkdiv(), mrcc0.mrcc_lpi2c4_clksel()),
-        };
-
-        let (freq, variant) = match self.source {
-            Lpi2cClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = Lpi2cClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = Lpi2cClkselMux::I0ClkrootFunc0;
-
-                (freq, mux)
-            }
-            Lpi2cClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = Lpi2cClkselMux::ClkrootFunc2;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = Lpi2cClkselMux::I2ClkrootFunc2;
-
-                (freq, mux)
-            }
+        let freq = match self.source {
+            Lpi2cClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            Lpi2cClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(feature = "mcxa2xx")]
             #[cfg(not(feature = "sosc-as-gpio"))]
-            Lpi2cClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-                (freq, Lpi2cClkselMux::ClkrootFunc3)
-            }
-            Lpi2cClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = Lpi2cClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = Lpi2cClkselMux::I5ClkrootFunc5;
-
-                (freq, mux)
-            }
+            Lpi2cClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            Lpi2cClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(feature = "mcxa2xx")]
-            Lpi2cClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-                (freq, Lpi2cClkselMux::ClkrootFunc6)
-            }
-            Lpi2cClockSel::None => {
-                // no ClkrootFunc7, just write manually for now
-                clksel.write(|w| w.0 = 0b111);
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::Off);
-                    w.set_halt(ClkdivHalt::Off);
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            Lpi2cClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            Lpi2cClockSel::None => return Ok(0),
         };
+
         let div = self.div.into_divisor();
         let expected = freq / div;
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
@@ -1141,6 +1296,68 @@ impl SPConfHelper for Lpi2cConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for Lpi2cConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        Lpi2cConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            Lpi2cInstance::Lpi2c0 => (mrcc0.mrcc_lpi2c0_clkdiv(), mrcc0.mrcc_lpi2c0_clksel()),
+            Lpi2cInstance::Lpi2c1 => (mrcc0.mrcc_lpi2c1_clkdiv(), mrcc0.mrcc_lpi2c1_clksel()),
+            Lpi2cInstance::Lpi2c2 => (mrcc0.mrcc_lpi2c2_clkdiv(), mrcc0.mrcc_lpi2c2_clksel()),
+            Lpi2cInstance::Lpi2c3 => (mrcc0.mrcc_lpi2c3_clkdiv(), mrcc0.mrcc_lpi2c3_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            Lpi2cInstance::Lpi2c4 => (mrcc0.mrcc_lpi2c4_clkdiv(), mrcc0.mrcc_lpi2c4_clksel()),
+        };
+
+        let variant = match self.source {
+            Lpi2cClockSel::FroLfDiv => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = Lpi2cClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = Lpi2cClkselMux::I0ClkrootFunc0;
+
+                mux
+            }
+            Lpi2cClockSel::FroHfDiv => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = Lpi2cClkselMux::ClkrootFunc2;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = Lpi2cClkselMux::I2ClkrootFunc2;
+
+                mux
+            }
+            #[cfg(feature = "mcxa2xx")]
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            Lpi2cClockSel::ClkIn => Lpi2cClkselMux::ClkrootFunc3,
+            Lpi2cClockSel::Clk1M => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = Lpi2cClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = Lpi2cClkselMux::I5ClkrootFunc5;
+
+                mux
+            }
+            #[cfg(feature = "mcxa2xx")]
+            Lpi2cClockSel::Pll1ClkDiv => Lpi2cClkselMux::ClkrootFunc6,
+            Lpi2cClockSel::None => {
+                // no ClkrootFunc7, just write manually for now
+                clksel.write(|w| w.0 = 0b111);
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::Off);
+                    w.set_halt(ClkdivHalt::Off);
+                });
+                return PreEnableParts::empty();
+            }
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
@@ -1206,93 +1423,37 @@ pub struct LpuartConfig {
     pub(crate) instance: LpuartInstance,
 }
 
-impl SPConfHelper for LpuartConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+impl LpuartConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            LpuartInstance::Lpuart0 => (mrcc0.mrcc_lpuart0_clkdiv(), mrcc0.mrcc_lpuart0_clksel()),
-            LpuartInstance::Lpuart1 => (mrcc0.mrcc_lpuart1_clkdiv(), mrcc0.mrcc_lpuart1_clksel()),
-            LpuartInstance::Lpuart2 => (mrcc0.mrcc_lpuart2_clkdiv(), mrcc0.mrcc_lpuart2_clksel()),
-            LpuartInstance::Lpuart3 => (mrcc0.mrcc_lpuart3_clkdiv(), mrcc0.mrcc_lpuart3_clksel()),
-            LpuartInstance::Lpuart4 => (mrcc0.mrcc_lpuart4_clkdiv(), mrcc0.mrcc_lpuart4_clksel()),
-            LpuartInstance::Lpuart5 => (mrcc0.mrcc_lpuart5_clkdiv(), mrcc0.mrcc_lpuart5_clksel()),
-        };
-
-        let (freq, variant) = match self.source {
-            LpuartClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpuartClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpuartClkselMux::I0ClkrootSircDiv;
-
-                (freq, mux)
-            }
-            LpuartClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpuartClkselMux::ClkrootFunc2;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpuartClkselMux::I2ClkrootFircDiv;
-
-                (freq, mux)
-            }
+        let freq = match self.source {
+            LpuartClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpuartClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(not(feature = "sosc-as-gpio"))]
-            LpuartClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpuartClkselMux::ClkrootFunc3;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpuartClkselMux::I3ClkrootSosc;
-
-                (freq, mux)
-            }
+            LpuartClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(feature = "mcxa2xx")]
-            LpuartClockSel::Clk16K => {
-                let freq = clocks.ensure_clk_16k_vdd_core_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpuartClkselMux::ClkrootFunc4;
-                // #[cfg(feature = "mcxa5xx")]
-                // let mux = LpuartClkselMux::I4_CLKROOT_LPOSC;
-
-                (freq, mux)
-            }
-            LpuartClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpuartClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpuartClkselMux::I5Clkroot1m;
-
-                (freq, mux)
-            }
-            LpuartClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = LpuartClkselMux::ClkrootFunc6;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = LpuartClkselMux::I6ClkrootSpllDiv;
-
-                (freq, mux)
-            }
-            LpuartClockSel::None => {
-                // no ClkrootFunc7, just write manually for now
-                clksel.write(|w| w.set_mux(LpuartClkselMux::_RESERVED_7));
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::On);
-                    w.set_halt(ClkdivHalt::On);
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            LpuartClockSel::Clk16K => match clocks.ensure_clk_16k_vdd_core_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpuartClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpuartClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            LpuartClockSel::None => return Ok(0),
         };
 
         // Check clock speed is reasonable
@@ -1320,6 +1481,95 @@ impl SPConfHelper for LpuartConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for LpuartConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        LpuartConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            LpuartInstance::Lpuart0 => (mrcc0.mrcc_lpuart0_clkdiv(), mrcc0.mrcc_lpuart0_clksel()),
+            LpuartInstance::Lpuart1 => (mrcc0.mrcc_lpuart1_clkdiv(), mrcc0.mrcc_lpuart1_clksel()),
+            LpuartInstance::Lpuart2 => (mrcc0.mrcc_lpuart2_clkdiv(), mrcc0.mrcc_lpuart2_clksel()),
+            LpuartInstance::Lpuart3 => (mrcc0.mrcc_lpuart3_clkdiv(), mrcc0.mrcc_lpuart3_clksel()),
+            LpuartInstance::Lpuart4 => (mrcc0.mrcc_lpuart4_clkdiv(), mrcc0.mrcc_lpuart4_clksel()),
+            LpuartInstance::Lpuart5 => (mrcc0.mrcc_lpuart5_clkdiv(), mrcc0.mrcc_lpuart5_clksel()),
+        };
+
+        let variant = match self.source {
+            LpuartClockSel::FroLfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpuartClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpuartClkselMux::I0ClkrootSircDiv;
+
+                mux
+            }
+            LpuartClockSel::FroHfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpuartClkselMux::ClkrootFunc2;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpuartClkselMux::I2ClkrootFircDiv;
+
+                mux
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            LpuartClockSel::ClkIn => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpuartClkselMux::ClkrootFunc3;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpuartClkselMux::I3ClkrootSosc;
+
+                mux
+            }
+            #[cfg(feature = "mcxa2xx")]
+            LpuartClockSel::Clk16K => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpuartClkselMux::ClkrootFunc4;
+                // #[cfg(feature = "mcxa5xx")]
+                // let mux = LpuartClkselMux::I4_CLKROOT_LPOSC;
+
+                mux
+            }
+            LpuartClockSel::Clk1M => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpuartClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpuartClkselMux::I5Clkroot1m;
+
+                mux
+            }
+            LpuartClockSel::Pll1ClkDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = LpuartClkselMux::ClkrootFunc6;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = LpuartClkselMux::I6ClkrootSpllDiv;
+
+                mux
+            }
+            LpuartClockSel::None => {
+                // no ClkrootFunc7, just write manually for now
+                clksel.write(|w| w.set_mux(LpuartClkselMux::_RESERVED_7));
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::On);
+                    w.set_halt(ClkdivHalt::On);
+                });
+                return PreEnableParts::empty();
+            }
+        };
 
         // set clksel
         apply_div4!(self, clksel, clkdiv, variant, freq)
@@ -1383,94 +1633,37 @@ pub struct CTimerConfig {
     pub(crate) instance: CTimerInstance,
 }
 
-impl SPConfHelper for CTimerConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+impl CTimerConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            CTimerInstance::CTimer0 => (mrcc0.mrcc_ctimer0_clkdiv(), mrcc0.mrcc_ctimer0_clksel()),
-            CTimerInstance::CTimer1 => (mrcc0.mrcc_ctimer1_clkdiv(), mrcc0.mrcc_ctimer1_clksel()),
-            CTimerInstance::CTimer2 => (mrcc0.mrcc_ctimer2_clkdiv(), mrcc0.mrcc_ctimer2_clksel()),
-            CTimerInstance::CTimer3 => (mrcc0.mrcc_ctimer3_clkdiv(), mrcc0.mrcc_ctimer3_clksel()),
-            CTimerInstance::CTimer4 => (mrcc0.mrcc_ctimer4_clkdiv(), mrcc0.mrcc_ctimer4_clksel()),
-        };
-
-        let (freq, variant) = match self.source {
-            CTimerClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = CtimerClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = CtimerClkselMux::I0ClkrootSircDiv;
-
-                (freq, mux)
-            }
-            CTimerClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = CtimerClkselMux::ClkrootFunc1;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = CtimerClkselMux::I1ClkrootFircGated;
-
-                (freq, mux)
-            }
+        let freq = match self.source {
+            CTimerClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CTimerClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(not(feature = "sosc-as-gpio"))]
-            CTimerClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = CtimerClkselMux::ClkrootFunc3;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = CtimerClkselMux::I3ClkrootSosc;
-
-                (freq, mux)
-            }
+            CTimerClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(feature = "mcxa2xx")]
-            CTimerClockSel::Clk16K => {
-                let freq = clocks.ensure_clk_16k_vdd_core_active(&self.power)?;
-
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = CtimerClkselMux::ClkrootFunc4;
-                // TODO: MCXA5xx uses "LPOSC", which can either be clk_16k or clk_32k.
-                // We do not support this yet.
-                // #[cfg(feature = "mcxa5xx")]
-                // let mux = CtimerClkselMux::I4_CLKROOT_LPOSC;
-
-                (freq, mux)
-            }
-            CTimerClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = CtimerClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = CtimerClkselMux::I5Clkroot1m;
-
-                (freq, mux)
-            }
-            CTimerClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-                // TODO: fix PAC names for consistency
-                #[cfg(feature = "mcxa2xx")]
-                let mux = CtimerClkselMux::ClkrootFunc6;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = CtimerClkselMux::I6ClkrootSpllDiv;
-
-                (freq, mux)
-            }
-            CTimerClockSel::None => {
-                // no ClkrootFunc7, just write manually for now
-                clksel.write(|w| w.set_mux(CtimerClkselMux::_RESERVED_7));
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::On);
-                    w.set_halt(ClkdivHalt::On)
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            CTimerClockSel::Clk16K => match clocks.ensure_clk_16k_vdd_core_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CTimerClockSel::Clk1M => match clocks.ensure_clk_1m_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CTimerClockSel::Pll1ClkDiv => match clocks.ensure_pll1_clk_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CTimerClockSel::None => return Ok(0),
         };
 
         let div = self.div.into_divisor();
@@ -1499,6 +1692,96 @@ impl SPConfHelper for CTimerConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for CTimerConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        CTimerConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            CTimerInstance::CTimer0 => (mrcc0.mrcc_ctimer0_clkdiv(), mrcc0.mrcc_ctimer0_clksel()),
+            CTimerInstance::CTimer1 => (mrcc0.mrcc_ctimer1_clkdiv(), mrcc0.mrcc_ctimer1_clksel()),
+            CTimerInstance::CTimer2 => (mrcc0.mrcc_ctimer2_clkdiv(), mrcc0.mrcc_ctimer2_clksel()),
+            CTimerInstance::CTimer3 => (mrcc0.mrcc_ctimer3_clkdiv(), mrcc0.mrcc_ctimer3_clksel()),
+            CTimerInstance::CTimer4 => (mrcc0.mrcc_ctimer4_clkdiv(), mrcc0.mrcc_ctimer4_clksel()),
+        };
+
+        let variant = match self.source {
+            CTimerClockSel::FroLfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = CtimerClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = CtimerClkselMux::I0ClkrootSircDiv;
+
+                mux
+            }
+            CTimerClockSel::FroHfDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = CtimerClkselMux::ClkrootFunc1;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = CtimerClkselMux::I1ClkrootFircGated;
+
+                mux
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            CTimerClockSel::ClkIn => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = CtimerClkselMux::ClkrootFunc3;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = CtimerClkselMux::I3ClkrootSosc;
+
+                mux
+            }
+            #[cfg(feature = "mcxa2xx")]
+            CTimerClockSel::Clk16K => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = CtimerClkselMux::ClkrootFunc4;
+                // TODO: MCXA5xx uses "LPOSC", which can either be clk_16k or clk_32k.
+                // We do not support this yet.
+                // #[cfg(feature = "mcxa5xx")]
+                // let mux = CtimerClkselMux::I4_CLKROOT_LPOSC;
+
+                mux
+            }
+            CTimerClockSel::Clk1M => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = CtimerClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = CtimerClkselMux::I5Clkroot1m;
+
+                mux
+            }
+            CTimerClockSel::Pll1ClkDiv => {
+                // TODO: fix PAC names for consistency
+                #[cfg(feature = "mcxa2xx")]
+                let mux = CtimerClkselMux::ClkrootFunc6;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = CtimerClkselMux::I6ClkrootSpllDiv;
+
+                mux
+            }
+            CTimerClockSel::None => {
+                // no ClkrootFunc7, just write manually for now
+                clksel.write(|w| w.set_mux(CtimerClkselMux::_RESERVED_7));
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::On);
+                    w.set_halt(ClkdivHalt::On)
+                });
+                return PreEnableParts::empty();
+            }
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
@@ -1551,61 +1834,27 @@ pub struct CanConfig {
     pub(crate) instance: CanInstance,
 }
 
-impl SPConfHelper for CanConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            CanInstance::Can0 => (mrcc0.mrcc_flexcan0_clkdiv(), mrcc0.mrcc_flexcan0_clksel()),
-            CanInstance::Can1 => (mrcc0.mrcc_flexcan1_clkdiv(), mrcc0.mrcc_flexcan1_clksel()),
-        };
-
-        let (freq, variant) = match self.source {
-            CanClockSel::FroHf => {
-                let freq = clocks.ensure_fro_hf_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = FlexcanClkselMux::ClkrootFircGated;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = FlexcanClkselMux::I1ClkrootFircGated;
-
-                (freq, mux)
-            }
-            CanClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = FlexcanClkselMux::ClkrootFircDiv;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = FlexcanClkselMux::I2ClkrootFircDiv;
-
-                (freq, mux)
-            }
+impl CanConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        let freq = match self.source {
+            CanClockSel::FroHf => match clocks.ensure_fro_hf_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CanClockSel::FroHfDiv => match clocks.ensure_fro_hf_div_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
             #[cfg(not(feature = "sosc-as-gpio"))]
-            CanClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = FlexcanClkselMux::ClkrootSosc;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = FlexcanClkselMux::I3ClkrootSosc;
-
-                (freq, mux)
-            }
-            CanClockSel::Pll1Clk => {
-                let freq = clocks.ensure_pll1_clk_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = FlexcanClkselMux::ClkrootSpll;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = FlexcanClkselMux::I6ClkrootSpll;
-
-                (freq, mux)
-            }
-            CanClockSel::None => {
-                clksel.write(|w| w.set_mux(FlexcanClkselMux::_RESERVED_7));
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::On);
-                    w.set_halt(ClkdivHalt::On);
-                });
-                return Ok(PreEnableParts::empty());
-            }
+            CanClockSel::ClkIn => match clocks.ensure_clk_in_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CanClockSel::Pll1Clk => match clocks.ensure_pll1_clk_active(&self.power) {
+                Ok(freq) => freq,
+                Err(e) => return Err(e),
+            },
+            CanClockSel::None => return Ok(0),
         };
 
         // These values for MidDriveMode, NormalMode, and OverDriveMode come from the
@@ -1636,6 +1885,67 @@ impl SPConfHelper for CanConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(freq)
+    }
+}
+
+impl SPConfHelper for CanConfig {
+    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        CanConfig::validate(self, clocks)
+    }
+
+    fn apply(&self, freq: u32) -> PreEnableParts {
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            CanInstance::Can0 => (mrcc0.mrcc_flexcan0_clkdiv(), mrcc0.mrcc_flexcan0_clksel()),
+            CanInstance::Can1 => (mrcc0.mrcc_flexcan1_clkdiv(), mrcc0.mrcc_flexcan1_clksel()),
+        };
+
+        let variant = match self.source {
+            CanClockSel::FroHf => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexcanClkselMux::ClkrootFircGated;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexcanClkselMux::I1ClkrootFircGated;
+
+                mux
+            }
+            CanClockSel::FroHfDiv => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexcanClkselMux::ClkrootFircDiv;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexcanClkselMux::I2ClkrootFircDiv;
+
+                mux
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            CanClockSel::ClkIn => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexcanClkselMux::ClkrootSosc;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexcanClkselMux::I3ClkrootSosc;
+
+                mux
+            }
+            CanClockSel::Pll1Clk => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexcanClkselMux::ClkrootSpll;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexcanClkselMux::I6ClkrootSpll;
+
+                mux
+            }
+            CanClockSel::None => {
+                clksel.write(|w| w.set_mux(FlexcanClkselMux::_RESERVED_7));
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::On);
+                    w.set_halt(ClkdivHalt::On);
+                });
+                return PreEnableParts::empty();
+            }
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }
