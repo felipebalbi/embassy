@@ -9,6 +9,7 @@ use config::{
 };
 use cortex_m::peripheral::SCB;
 
+use super::calc;
 use super::config;
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::{ClockLimits, clock_limits};
@@ -62,29 +63,21 @@ impl ClockOperator<'_> {
     }
 
     fn active_limits(&self) -> &'static ClockLimits {
-        match self.config.vdd_power.active_mode.level {
-            VddLevel::MidDriveMode => &ClockLimits::MID_DRIVE,
-            #[cfg(feature = "mcxa5xx")]
-            VddLevel::NormalMode => &ClockLimits::NORMAL_DRIVE,
-            VddLevel::OverDriveMode => &ClockLimits::OVER_DRIVE,
-        }
+        calc::active_limits(self.config.vdd_power.active_mode.level)
     }
 
+    #[allow(dead_code)]
     fn low_power_limits(&self) -> &'static ClockLimits {
-        match self.config.vdd_power.low_power_mode.level {
-            VddLevel::MidDriveMode => &ClockLimits::MID_DRIVE,
-            #[cfg(feature = "mcxa5xx")]
-            VddLevel::NormalMode => &ClockLimits::NORMAL_DRIVE,
-            VddLevel::OverDriveMode => &ClockLimits::OVER_DRIVE,
-        }
+        calc::low_power_limits(self.config.vdd_power.low_power_mode.level)
     }
 
     fn lowest_relevant_limits(&self, for_power: &PoweredClock) -> &'static ClockLimits {
         // We always enforce that deep sleep has a drive <= active mode.
-        match for_power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => self.active_limits(),
-            PoweredClock::AlwaysEnabled => self.low_power_limits(),
-        }
+        calc::lowest_relevant_limits(
+            self.config.vdd_power.active_mode.level,
+            self.config.vdd_power.low_power_mode.level,
+            *for_power,
+        )
     }
 
     /// Configure the FIRC/FRO180M/FRO192M clock family
@@ -200,11 +193,9 @@ impl ClockOperator<'_> {
 
         // Do we enable the `fro_hf` output?
         let fro_hf_set = if *fro_hf_enabled {
-            if base_freq > limits.fro_hf {
-                return Err(ClockError::BadConfig {
-                    clock: "fro_hf",
-                    reason: "exceeds max",
-                });
+            match calc::validate_max_frequency(base_freq, limits.fro_hf, "fro_hf", "exceeds max") {
+                Ok(()) => {}
+                Err(e) => return Err(e),
             }
 
             self.clocks.fro_hf = Some(Clock {
@@ -219,7 +210,7 @@ impl ClockOperator<'_> {
         // Do we enable the `clk_45m`/`clk_48m` output?
         let clk_fund_set = if *clk_hf_fundamental_enabled {
             self.clocks.clk_hf_fundamental = Some(Clock {
-                frequency: 45_000_000,
+                frequency: calc::CLK_HF_FUNDAMENTAL_FREQUENCY,
                 power: *power,
             });
             true
@@ -246,12 +237,10 @@ impl ClockOperator<'_> {
                 });
             }
 
-            let div_freq = base_freq / d.into_divisor();
-            if div_freq > limits.fro_hf_div {
-                return Err(ClockError::BadConfig {
-                    clock: "fro_hf_root",
-                    reason: "exceeds max frequency",
-                });
+            let div_freq = calc::divided_frequency(base_freq, *d);
+            match calc::validate_max_frequency(div_freq, limits.fro_hf_div, "fro_hf_root", "exceeds max frequency") {
+                Ok(()) => {}
+                Err(e) => return Err(e),
             }
 
             // Halt and reset the div; then set our desired div.
@@ -287,7 +276,7 @@ impl ClockOperator<'_> {
             fro_12m_enabled,
             fro_lf_div,
         } = &self.config.sirc;
-        let base_freq = 12_000_000;
+        let base_freq = calc::FRO_12M_FREQUENCY;
 
         // Allow writes
         self.scg0.sirccsr().modify(|w| w.set_lk(SirccsrLk::WriteEnabled));
@@ -303,7 +292,7 @@ impl ClockOperator<'_> {
 
         // clk_1m is *before* the fro_12m clock gate
         self.clocks.clk_1m = Some(Clock {
-            frequency: base_freq / 12,
+            frequency: calc::clk_1m_frequency(base_freq),
             power: *power,
         });
 
@@ -366,7 +355,7 @@ impl ClockOperator<'_> {
 
             // Store off the clock info
             self.clocks.fro_lf_div = Some(Clock {
-                frequency: base_freq / d.into_divisor(),
+                frequency: calc::divided_frequency(base_freq, *d),
                 power: *power,
             });
         }
@@ -420,14 +409,14 @@ impl ClockOperator<'_> {
         if *vsys_domain_active {
             bits |= 0b01;
             self.clocks.clk_16k_vsys = Some(Clock {
-                frequency: 16_384,
+                frequency: calc::FRO_16K_FREQUENCY,
                 power: PoweredClock::AlwaysEnabled,
             });
         }
         if *vdd_core_domain_active {
             bits |= 0b10;
             self.clocks.clk_16k_vdd_core = Some(Clock {
-                frequency: 16_384,
+                frequency: calc::FRO_16K_FREQUENCY,
                 power: PoweredClock::AlwaysEnabled,
             });
         }
@@ -435,7 +424,7 @@ impl ClockOperator<'_> {
         if *vbat_domain_active {
             bits |= 0b100;
             self.clocks.clk_16k_vbat = Some(Clock {
-                frequency: 16_384,
+                frequency: calc::FRO_16K_FREQUENCY,
                 power: PoweredClock::AlwaysEnabled,
             });
         }
@@ -560,7 +549,7 @@ impl ClockOperator<'_> {
 
                 // 5. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
                 const ENABLED: Option<Clock> = Some(Clock {
-                    frequency: 32_768,
+                    frequency: calc::OSC_32K_FREQUENCY,
                     power: PoweredClock::NormalEnabledDeepSleepDisabled,
                 });
                 self.vbat0.oscclke().modify(|w| {
@@ -649,7 +638,7 @@ impl ClockOperator<'_> {
 
                 // 7. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
                 const ENABLED: Option<Clock> = Some(Clock {
-                    frequency: 32_768,
+                    frequency: calc::OSC_32K_FREQUENCY,
                     power: PoweredClock::AlwaysEnabled,
                 });
                 self.vbat0.oscclke().modify(|w| {
@@ -729,23 +718,12 @@ impl ClockOperator<'_> {
         // MediumFreq = 2,
         // #[doc = "3: Frequency range select of 40-50 MHz."]
         // HighFreq = 3,
-        let range = match freq {
-            0..8_000_000 => {
-                return Err(ClockError::BadConfig {
-                    clock: "clk_in",
-                    reason: "freq too low",
-                });
-            }
-            8_000_000..16_000_000 => Range::Freq16to20mhz,
-            16_000_000..25_000_000 => Range::LowFreq,
-            25_000_000..40_000_000 => Range::MediumFreq,
-            40_000_000..50_000_001 => Range::HighFreq,
-            50_000_001.. => {
-                return Err(ClockError::BadConfig {
-                    clock: "clk_in",
-                    reason: "freq too high",
-                });
-            }
+        let range = match calc::sosc_range(freq) {
+            Ok(calc::SoscRange::Freq8To16Mhz) => Range::Freq16to20mhz,
+            Ok(calc::SoscRange::Freq16To25Mhz) => Range::LowFreq,
+            Ok(calc::SoscRange::Freq25To40Mhz) => Range::MediumFreq,
+            Ok(calc::SoscRange::Freq40To50Mhz) => Range::HighFreq,
+            Err(e) => return Err(e),
         };
 
         // Set source/erefs and range
@@ -893,47 +871,19 @@ impl ClockOperator<'_> {
         let fout: Option<u32>;
         let fcco: Option<u32>;
 
-        let m_check = |m: u16| {
-            if !(1..=u16::MAX).contains(&m) {
-                Err(ClockError::BadConfig {
-                    clock: "spll",
-                    reason: "m_mult out of range",
-                })
-            } else {
-                Ok(m)
-            }
-        };
-        let p_check = |p: u8| {
-            if !(1..=31).contains(&p) {
-                Err(ClockError::BadConfig {
-                    clock: "spll",
-                    reason: "p_div out of range",
-                })
-            } else {
-                Ok(p)
-            }
-        };
-        let n_check = |n: u8| {
-            if !(1..=u8::MAX).contains(&n) {
-                Err(ClockError::BadConfig {
-                    clock: "spll",
-                    reason: "n_div out of range",
-                })
-            } else {
-                Ok(n)
-            }
-        };
-
         match cfg.mode {
             // Fout = M x Fin
             config::SpllMode::Mode1a { m_mult } => {
                 bp_pre = true;
                 bp_post = true;
                 bp_post2 = false;
-                m = m_check(m_mult)?;
+                m = match calc::check_spll_m(m_mult) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
                 p = None;
                 n = None;
-                fcco = f_in.checked_mul(m_mult as u32);
+                fcco = calc::checked_spll_multiply(f_in, m_mult);
                 fout = fcco;
             }
             // if !bypass_p2_div: Fout = (M / (2 x P)) x Fin
@@ -946,25 +896,34 @@ impl ClockOperator<'_> {
                 bp_pre = true;
                 bp_post = false;
                 bp_post2 = bypass_p2_div;
-                m = m_check(m_mult)?;
-                p = Some(p_check(p_div)?);
+                m = match calc::check_spll_m(m_mult) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+                p = Some(match calc::check_spll_p(p_div) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                });
                 n = None;
-                let mut div = p_div as u32;
-                if !bypass_p2_div {
-                    div *= 2;
-                }
-                fcco = f_in.checked_mul(m_mult as u32);
-                fout = (f_in / div).checked_mul(m_mult as u32);
+                let div = calc::spll_post_divisor(p_div, bypass_p2_div);
+                fcco = calc::checked_spll_multiply(f_in, m_mult);
+                fout = calc::checked_spll_divide_then_multiply(f_in, div, m_mult);
             }
             // Fout = (M / N) x Fin
             config::SpllMode::Mode1c { m_mult, n_div } => {
                 bp_pre = false;
                 bp_post = true;
                 bp_post2 = false;
-                m = m_check(m_mult)?;
+                m = match calc::check_spll_m(m_mult) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
                 p = None;
-                n = Some(n_check(n_div)?);
-                fcco = (f_in / (n_div as u32)).checked_mul(m_mult as u32);
+                n = Some(match calc::check_spll_n(n_div) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                });
+                fcco = calc::checked_spll_divide_then_multiply(f_in, n_div as u32, m_mult);
                 fout = fcco;
             }
             // if !bypass_p2_div: Fout = (M / (N x 2 x P)) x Fin
@@ -978,16 +937,22 @@ impl ClockOperator<'_> {
                 bp_pre = false;
                 bp_post = false;
                 bp_post2 = bypass_p2_div;
-                m = m_check(m_mult)?;
-                p = Some(p_check(p_div)?);
-                n = Some(n_check(n_div)?);
+                m = match calc::check_spll_m(m_mult) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+                p = Some(match calc::check_spll_p(p_div) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                });
+                n = Some(match calc::check_spll_n(n_div) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                });
                 // This can't overflow: u8 x u8 (x 2) always fits in u32
-                let mut div = (p_div as u32) * (n_div as u32);
-                if !bypass_p2_div {
-                    div *= 2;
-                }
-                fcco = (f_in / (n_div as u32)).checked_mul(m_mult as u32);
-                fout = (f_in / div).checked_mul(m_mult as u32);
+                let div = calc::spll_pre_post_divisor(n_div, p_div, bypass_p2_div);
+                fcco = calc::checked_spll_divide_then_multiply(f_in, n_div as u32, m_mult);
+                fout = calc::checked_spll_divide_then_multiply(f_in, div, m_mult);
             }
         };
 
@@ -1006,56 +971,32 @@ impl ClockOperator<'_> {
         }
 
         // Ensure the Fcco and Fout calcs didn't overflow
-        let fcco = fcco.ok_or(ClockError::BadConfig {
-            clock: "spll",
-            reason: "fcco invalid1",
-        })?;
-        let fout = fout.ok_or(ClockError::BadConfig {
-            clock: "spll",
-            reason: "fout invalid",
-        })?;
+        let fcco = match calc::require_spll_fcco(fcco) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let fout = match calc::require_spll_fout(fout) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
 
         // Fcco: 275MHz to 550MHz
-        if !(275_000_000..=550_000_000).contains(&fcco) {
-            return Err(ClockError::BadConfig {
-                clock: "spll",
-                reason: "fcco invalid2",
-            });
+        match calc::validate_spll_fcco(fcco) {
+            Ok(()) => {}
+            Err(e) => return Err(e),
         }
 
         let limits = self.lowest_relevant_limits(&cfg.power);
 
         // Fout: 4.3MHz to 2x Max CPU Frequency
-        let fmax = limits.cpu_clk;
-        let spll_range_bad1 = !(4_300_000..=(2 * fmax)).contains(&fout);
-        let spll_range_bad2 = fout > limits.pll1_clk;
-
-        if spll_range_bad1 || spll_range_bad2 {
-            return Err(ClockError::BadConfig {
-                clock: "spll",
-                reason: "fout invalid",
-            });
+        match calc::validate_spll_fout(fout, limits) {
+            Ok(()) => {}
+            Err(e) => return Err(e),
         }
 
-        // A = floor(m / 4) + 1
-        let selp_a = (m / 4) + 1;
-        // SELP = A  if A <  31
-        //      = 31 if A >= 31
-        let selp = selp_a.min(31);
+        let selp = calc::spll_selp(m);
 
-        // A = 1                    if        M >= 8000
-        //   = floor(8000 / M)      if 8000 > M >= 122
-        //   = 2 x floor(M / 4) / 3 if 122  > M >= 1
-        let seli_a = if m >= 8000 {
-            1
-        } else if m >= 122 {
-            8000 / m
-        } else {
-            (2 * (m / 4)) / 3
-        };
-        // SELI = A  if A <  63
-        //      = 63 if A >= 63
-        let seli = seli_a.min(63);
+        let seli = calc::spll_seli(m);
         // SELR must be 0.
         let selr = 0;
 
@@ -1100,8 +1041,7 @@ impl ClockOperator<'_> {
         // LOCK_TIME = 500μs/T ref + 300, F ref = F in /N (input frequency divided by pre-divider ratio).
         //
         // 500us is 1/2000th of a second, therefore Fref / 2000 is the number of cycles in 500us.
-        let f_ref = if let Some(n) = n { f_in / (n as u32) } else { f_in };
-        let lock_time = f_ref.div_ceil(2000) + 300;
+        let lock_time = calc::spll_lock_time(f_in, n);
         self.scg0.splllock_cnfg().write(|w| w.set_lock_time(lock_time));
 
         // TODO: Support Spread spectrum?
@@ -1151,12 +1091,10 @@ impl ClockOperator<'_> {
 
         // Do we enable the `pll1_clk_div` output?
         if let Some(d) = cfg.pll1_clk_div.as_ref() {
-            let exp_freq = fout / d.into_divisor();
-            if exp_freq > limits.pll1_clk_div {
-                return Err(ClockError::BadConfig {
-                    clock: "pll1_clk_div",
-                    reason: "exceeds max frequency",
-                });
+            let exp_freq = calc::divided_frequency(fout, *d);
+            match calc::validate_max_frequency(exp_freq, limits.pll1_clk_div, "pll1_clk_div", "exceeds max frequency") {
+                Ok(()) => {}
+                Err(e) => return Err(e),
             }
 
             // Halt and reset the div; then set our desired div.
@@ -1230,24 +1168,25 @@ impl ClockOperator<'_> {
         };
 
         // Is the main_clk source in range for main_clk?
-        if main_clk_src.frequency > lowest_limits.main_clk {
-            return Err(ClockError::BadConfig {
-                clock: name,
-                reason: "Exceeds main_clock frequency",
-            });
+        match calc::validate_max_frequency(
+            main_clk_src.frequency,
+            lowest_limits.main_clk,
+            name,
+            "Exceeds main_clock frequency",
+        ) {
+            Ok(()) => {}
+            Err(e) => return Err(e),
         }
 
         // Calculate expected CPU frequency based on main_clk and AHB div
         let ahb_div = self.config.main_clock.ahb_clk_div;
-        let cpu_freq = main_clk_src.frequency / ahb_div.into_divisor();
+        let cpu_freq = calc::divided_frequency(main_clk_src.frequency, ahb_div);
 
         // Is the expected CPU frequency in range for cpu_clk? Note: the CPU
         // is never running in deep sleep, so we directly use the active limits here
-        if cpu_freq > active_limits.cpu_clk {
-            return Err(ClockError::BadConfig {
-                clock: name,
-                reason: "Exceeds ahb max frequency",
-            });
+        match calc::validate_max_frequency(cpu_freq, active_limits.cpu_clk, name, "Exceeds ahb max frequency") {
+            Ok(()) => {}
+            Err(e) => return Err(e),
         }
 
         // BEFORE we switch, update the flash wait states to the appropriate levels
@@ -1256,11 +1195,7 @@ impl ClockOperator<'_> {
         // WHICH source clock the limits apply to, but system/ahb/cpu is a fair bet.
         //
         // TODO: This calculation doesn't consider low power mode yet!
-        let wait_states = levels
-            .iter()
-            .find(|(fmax, _ws)| cpu_freq <= *fmax)
-            .map(|t| t.1)
-            .unwrap_or(wsmax);
+        let wait_states = calc::flash_wait_states(levels, wsmax, cpu_freq);
         self.fmu0.fctrl().modify(|w| w.set_rwsc(wait_states));
 
         // TODO: (Double) check if clock is actually valid before switching?

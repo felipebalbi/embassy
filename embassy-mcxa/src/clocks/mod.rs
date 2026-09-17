@@ -43,6 +43,7 @@ use critical_section::CriticalSection;
 
 use crate::pac;
 
+mod calc;
 pub mod config;
 mod gate;
 mod operator;

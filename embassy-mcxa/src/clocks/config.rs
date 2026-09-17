@@ -498,7 +498,7 @@ pub enum FircFreqSel {
 
 impl FircFreqSel {
     #[cfg(feature = "mcxa2xx")]
-    pub(crate) fn to_freq_and_sel(&self) -> (u32, FreqSel) {
+    pub(crate) const fn to_freq_and_sel(&self) -> (u32, FreqSel) {
         match self {
             FircFreqSel::Mhz45 => {
                 // We are default, there's nothing to do here.
@@ -511,7 +511,7 @@ impl FircFreqSel {
     }
 
     #[cfg(feature = "mcxa5xx")]
-    pub(crate) fn to_freq_and_sel(&self) -> (u32, FreqSel) {
+    pub(crate) const fn to_freq_and_sel(&self) -> (u32, FreqSel) {
         match self {
             FircFreqSel::Mhz48 => {
                 // We are default, there's nothing to do here.
