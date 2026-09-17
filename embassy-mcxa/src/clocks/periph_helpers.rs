@@ -120,6 +120,12 @@ macro_rules! apply_div4 {
             w.set_reset(ClkdivReset::On);
         });
 
+        // Wait for the divider to report a stable output.
+        //
+        // This wait is unbounded, and it runs inside the critical section
+        // entered by `gate::enable`, so interrupts stay masked for its
+        // duration. The divider has always been observed to stabilise in
+        // practice, so no timeout is imposed.
         while $divreg.read().unstab() == ClkdivUnstab::Off {}
 
         PreEnableParts {
