@@ -197,7 +197,7 @@ impl Div4 {
 pub struct UnimplementedConfig;
 
 impl UnimplementedConfig {
-    fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
         Err(ClockError::UnimplementedConfig)
     }
 }
@@ -221,7 +221,7 @@ impl SPConfHelper for UnimplementedConfig {
 pub struct NoConfig;
 
 impl NoConfig {
-    fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
         Ok(0)
     }
 }
@@ -244,7 +244,7 @@ impl SPConfHelper for NoConfig {
 pub struct Clk1MConfig;
 
 impl Clk1MConfig {
-    fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
         Ok(1_000_000)
     }
 }
@@ -307,7 +307,7 @@ pub struct DacConfig {
 }
 
 impl DacConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         let freq = match self.source {
             DacClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
                 Ok(freq) => freq,
@@ -486,7 +486,7 @@ pub struct AdcConfig {
 }
 
 impl AdcConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         let freq = match self.source {
             AdcClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
                 Ok(freq) => freq,
@@ -646,7 +646,7 @@ pub struct OsTimerConfig {
 }
 
 impl OsTimerConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // NOTE: complies with the peripheral clock max functional clock limits
         // (MCXA2xx 21.3.2, MCXA5xx 28.3.2), which is 1MHz, and we can only
         // select 1mhz/16khz.
@@ -770,7 +770,7 @@ pub struct LpspiConfig {
 }
 
 impl LpspiConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
         let freq = match self.source {
             LpspiClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
@@ -954,7 +954,7 @@ pub struct FlexspiConfig {
 
 #[cfg(feature = "mcxa5xx")]
 impl FlexspiConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         let freq = match self.source {
             FlexspiClockSel::FroHf => match clocks.ensure_fro_hf_active(&self.power) {
                 Ok(freq) => freq,
@@ -1071,7 +1071,7 @@ pub struct I3cConfig {
 }
 
 impl I3cConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // Peripheral clock max functional clock limits: MCXA2xx 21.3.2, MCXA5xx 28.3.2
         #[cfg(feature = "mcxa2xx")]
         // Always 25MHz maximum frequency.
@@ -1251,7 +1251,7 @@ pub struct Lpi2cConfig {
 }
 
 impl Lpi2cConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
         let freq = match self.source {
             Lpi2cClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
@@ -1435,7 +1435,7 @@ pub struct LpuartConfig {
 }
 
 impl LpuartConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
         let freq = match self.source {
             LpuartClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
@@ -1646,7 +1646,7 @@ pub struct CTimerConfig {
 }
 
 impl CTimerConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         // check that source is suitable
         let freq = match self.source {
             CTimerClockSel::FroLfDiv => match clocks.ensure_fro_lf_div_active(&self.power) {
@@ -1848,7 +1848,7 @@ pub struct CanConfig {
 }
 
 impl CanConfig {
-    fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
         let freq = match self.source {
             CanClockSel::FroHf => match clocks.ensure_fro_hf_active(&self.power) {
                 Ok(freq) => freq,
