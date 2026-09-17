@@ -226,7 +226,7 @@ pub enum PoweredClock {
 /// selected clocks are active at a suitable level at time of construction. These methods
 /// return the frequency of the requested clock, in Hertz, or a [`ClockError`].
 impl Clocks {
-    fn ensure_clock_active(
+    const fn ensure_clock_active(
         &self,
         clock: &Option<Clock>,
         name: &'static str,
@@ -249,26 +249,26 @@ impl Clocks {
 
     /// Ensure the `fro_lf_div` clock is active and valid at the given power state.
     #[inline]
-    pub fn ensure_fro_lf_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_fro_lf_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.fro_lf_div, "fro_lf_div", at_level)
     }
 
     /// Ensure the `fro_hf` clock is active and valid at the given power state.
     #[inline]
-    pub fn ensure_fro_hf_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_fro_hf_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.fro_hf, "fro_hf", at_level)
     }
 
     /// Ensure the `fro_hf_div` clock is active and valid at the given power state.
     #[inline]
-    pub fn ensure_fro_hf_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_fro_hf_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.fro_hf_div, "fro_hf_div", at_level)
     }
 
     /// Ensure the `clk_in` clock is active and valid at the given power state.
     #[cfg(not(feature = "sosc-as-gpio"))]
     #[inline]
-    pub fn ensure_clk_in_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_clk_in_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.clk_in, "clk_in", at_level)
     }
 
@@ -286,16 +286,15 @@ impl Clocks {
     }
 
     /// Ensure the `clk_16k_vdd_core` clock is active and valid at the given power state.
-    pub fn ensure_clk_16k_vdd_core_active(&self, _at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_clk_16k_vdd_core_active(&self, _at_level: &PoweredClock) -> Result<u32, ClockError> {
         // NOTE: clk_16k is always active in low power mode
-        Ok(self
-            .clk_16k_vdd_core
-            .as_ref()
-            .ok_or(ClockError::BadConfig {
+        match self.clk_16k_vdd_core.as_ref() {
+            Some(clock) => Ok(clock.frequency),
+            None => Err(ClockError::BadConfig {
                 clock: "clk_16k_vdd_core",
                 reason: "required but not active",
-            })?
-            .frequency)
+            }),
+        }
     }
 
     /// Ensure the `clk_16k_vbat` clock is active and valid at the given power state.
@@ -335,19 +334,19 @@ impl Clocks {
 
     /// Ensure the `clk_1m` clock is active and valid at the given power state.
     #[inline]
-    pub fn ensure_clk_1m_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_clk_1m_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.clk_1m, "clk_1m", at_level)
     }
 
     /// Ensure the `pll1_clk` clock is active and valid at the given power state.
     #[inline]
-    pub fn ensure_pll1_clk_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_pll1_clk_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.pll1_clk, "pll1_clk", at_level)
     }
 
     /// Ensure the `pll1_clk_div` clock is active and valid at the given power state.
     #[inline]
-    pub fn ensure_pll1_clk_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_pll1_clk_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
         self.ensure_clock_active(&self.pll1_clk_div, "pll1_clk_div", at_level)
     }
 
@@ -383,7 +382,7 @@ impl Clocks {
 
 impl PoweredClock {
     /// Does THIS clock meet the power requirements of the OTHER clock?
-    pub fn meets_requirement_of(&self, other: &Self) -> bool {
+    pub const fn meets_requirement_of(&self, other: &Self) -> bool {
         match (self, other) {
             (PoweredClock::NormalEnabledDeepSleepDisabled, PoweredClock::AlwaysEnabled) => false,
             (PoweredClock::NormalEnabledDeepSleepDisabled, PoweredClock::NormalEnabledDeepSleepDisabled) => true,
