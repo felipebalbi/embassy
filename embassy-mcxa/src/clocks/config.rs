@@ -6,6 +6,7 @@
 use nxp_pac::scg::FreqSel;
 
 use super::PoweredClock;
+use super::types::{ClockError, Clocks};
 
 /// This type represents a divider in the range 1..=256.
 ///
@@ -139,6 +140,21 @@ pub struct ClocksConfig {
     pub sosc: Option<SoscConfig>,
     /// SPLL
     pub spll: Option<SpllConfig>,
+}
+
+impl ClocksConfig {
+    /// Resolve this configuration into the [`Clocks`] state that
+    /// [`init()`](super::init) would produce, without touching any hardware.
+    ///
+    /// This is a `const fn`, so it can be used to check a configuration and obtain
+    /// the resulting clock frequencies at compile time.
+    ///
+    /// NOTE: this cannot model hardware readiness — oscillator valid bits, PLL lock,
+    /// error flags, or divider stability — so a configuration accepted here may still
+    /// fail at run time for a hardware reason.
+    pub const fn resolve(&self) -> Result<Clocks, ClockError> {
+        super::calc::resolve(self)
+    }
 }
 
 // Power (which is not a clock)

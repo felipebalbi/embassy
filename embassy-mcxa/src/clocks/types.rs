@@ -299,16 +299,15 @@ impl Clocks {
 
     /// Ensure the `clk_16k_vbat` clock is active and valid at the given power state.
     #[cfg(feature = "mcxa5xx")]
-    pub fn ensure_clk_16k_vbat_active(&self, _at_level: &PoweredClock) -> Result<u32, ClockError> {
+    pub const fn ensure_clk_16k_vbat_active(&self, _at_level: &PoweredClock) -> Result<u32, ClockError> {
         // NOTE: clk_16k is always active in low power mode
-        Ok(self
-            .clk_16k_vbat
-            .as_ref()
-            .ok_or(ClockError::BadConfig {
+        match self.clk_16k_vbat.as_ref() {
+            Some(clock) => Ok(clock.frequency),
+            None => Err(ClockError::BadConfig {
                 clock: "clk_16k_vbat",
                 reason: "required but not active",
-            })?
-            .frequency)
+            }),
+        }
     }
 
     /// Ensure the `clk_32k_vsys` clock is active and valid at the given power state.

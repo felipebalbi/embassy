@@ -173,16 +173,10 @@ impl ClockOperator<'_> {
         } = firc;
 
         // When is the FRO enabled?
-        let (bg_good, pow_set) = match power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => {
-                // We only need bandgap enabled in active Mode
-                (self.clocks.bandgap_active, Fircsten::DisabledInStopModes)
-            }
-            PoweredClock::AlwaysEnabled => {
-                // We need bandgaps enabled in both active and deep sleep mode
-                let bg_good = self.clocks.bandgap_active && self.clocks.bandgap_lowpower;
-                (bg_good, Fircsten::EnabledInStopModes)
-            }
+        let bg_good = calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, *power);
+        let pow_set = match power {
+            PoweredClock::NormalEnabledDeepSleepDisabled => Fircsten::DisabledInStopModes,
+            PoweredClock::AlwaysEnabled => Fircsten::EnabledInStopModes,
         };
         if !bg_good {
             return Err(ClockError::BadConfig {
@@ -664,10 +658,8 @@ impl ClockOperator<'_> {
     }
 
     fn ensure_ldo_active(&mut self, for_clock: &'static str, for_power: &PoweredClock) -> Result<(), ClockError> {
-        let bg_good = match for_power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => self.clocks.bandgap_active,
-            PoweredClock::AlwaysEnabled => self.clocks.bandgap_active && self.clocks.bandgap_lowpower,
-        };
+        let bg_good =
+            calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, *for_power);
         if !bg_good {
             return Err(ClockError::BadConfig {
                 clock: for_clock,
@@ -742,9 +734,11 @@ impl ClockOperator<'_> {
         // * If SOSC needs to work in deep sleep, AND the monitor is enabled:
         //   * SIRC also need needs to be low power
         // * We need to decide if we need an interrupt or a reset if the monitor trips
-        let (bg_good, soscsten) = match parts.power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => (self.clocks.bandgap_active, false),
-            PoweredClock::AlwaysEnabled => (self.clocks.bandgap_active && self.clocks.bandgap_lowpower, true),
+        let bg_good =
+            calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, parts.power);
+        let soscsten = match parts.power {
+            PoweredClock::NormalEnabledDeepSleepDisabled => false,
+            PoweredClock::AlwaysEnabled => true,
         };
 
         if !bg_good {
@@ -1046,12 +1040,11 @@ impl ClockOperator<'_> {
 
         // TODO: Support Spread spectrum?
 
-        let (bg_good, spllsten) = match cfg.power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => (self.clocks.bandgap_active, Spllsten::DisabledInStop),
-            PoweredClock::AlwaysEnabled => (
-                self.clocks.bandgap_active && self.clocks.bandgap_lowpower,
-                Spllsten::EnabledInStop,
-            ),
+        let bg_good =
+            calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, cfg.power);
+        let spllsten: Spllsten = match cfg.power {
+            PoweredClock::NormalEnabledDeepSleepDisabled => Spllsten::DisabledInStop,
+            PoweredClock::AlwaysEnabled => Spllsten::EnabledInStop,
         };
         if !bg_good {
             return Err(ClockError::BadConfig {
@@ -1298,45 +1291,16 @@ impl ClockOperator<'_> {
         // level settings.
         //
         // TODO(AJM): I don't really understand this! Enforce it literally for now I guess.
-        const BAD_ASCENDING: Result<(), ClockError> = Err(ClockError::BadConfig {
-            clock: "vdd_power",
-            reason: "Deep sleep can't have higher level than active mode",
-        });
-        let ds_match = self.config.vdd_power.active_mode.drive == self.config.vdd_power.low_power_mode.drive;
-        let (vdd_match, lpwkup) = match (
+        let ds_match = calc::vdd_drive_matches(
+            self.config.vdd_power.active_mode.drive,
+            self.config.vdd_power.low_power_mode.drive,
+        );
+        let (vdd_match, lpwkup) = match calc::vdd_level_transition(
             self.config.vdd_power.active_mode.level,
             self.config.vdd_power.low_power_mode.level,
         ) {
-            //
-            // Correct "descending" options
-            //
-            // When voltage levels are not the same between ACTIVE mode and Low Power mode, you must write a
-            // nonzero value to SPC->LPWKUP_DELAY.
-            //
-            // This SHOULD be covered by table 165. LPWKUP Delay, but it doesn't actually have
-            // a value for the 1.0v-1.2v transition we need. For now, the C SDK always uses 0x5B.
-            #[cfg(feature = "mcxa5xx")]
-            (VddLevel::OverDriveMode, VddLevel::NormalMode) => (false, 0x005b),
-            (VddLevel::OverDriveMode, VddLevel::MidDriveMode) => (false, 0x005b),
-            #[cfg(feature = "mcxa5xx")]
-            (VddLevel::NormalMode, VddLevel::MidDriveMode) => (false, 0x005b),
-
-            //
-            // Incorrect "ascending" options
-            //
-            // For now, enforce that active is always >= voltage to low power. I don't know if this
-            // is required, but there's probably also no reason to support it?
-            #[cfg(feature = "mcxa5xx")]
-            (VddLevel::MidDriveMode, VddLevel::NormalMode) => return BAD_ASCENDING,
-            (VddLevel::MidDriveMode, VddLevel::OverDriveMode) => return BAD_ASCENDING,
-            #[cfg(feature = "mcxa5xx")]
-            (VddLevel::NormalMode, VddLevel::OverDriveMode) => return BAD_ASCENDING,
-
-            // Correct "matching" options
-            (VddLevel::MidDriveMode, VddLevel::MidDriveMode) => (true, 0x0000),
-            #[cfg(feature = "mcxa5xx")]
-            (VddLevel::NormalMode, VddLevel::NormalMode) => (true, 0x0000),
-            (VddLevel::OverDriveMode, VddLevel::OverDriveMode) => (true, 0x0000),
+            Ok(value) => value,
+            Err(e) => return Err(e),
         };
         self.spc0.lpwkup_delay().write(|w| w.set_lpwkup_delay(lpwkup));
 
@@ -1359,7 +1323,8 @@ impl ClockOperator<'_> {
         // for low power mode. We'll just configure it, I guess?
         //
         // NOTE(AJM): "LP_CFG: This register resets only after a POR or LVD event."
-        let (ds, bgap) = match self.config.vdd_power.low_power_mode.drive {
+        let bgap = calc::bandgap_enabled(self.config.vdd_power.low_power_mode.drive);
+        let ds = match self.config.vdd_power.low_power_mode.drive {
             VddDriveStrength::Low { enable_bandgap } => {
                 // If the bandgap is enabled, also enable the high/low voltage
                 // detectors. if it is disabled, these must also be disabled.
@@ -1369,11 +1334,11 @@ impl ClockOperator<'_> {
                     w.set_core_lvde(enable_bandgap);
                 });
 
-                (pac::spc::LpCfgCoreldoVddDs::Low, enable_bandgap)
+                pac::spc::LpCfgCoreldoVddDs::Low
             }
             VddDriveStrength::Normal => {
                 // "If you specify normal drive strength, you must write a value to LP[BGMODE] that enables the bandgap."
-                (pac::spc::LpCfgCoreldoVddDs::Normal, true)
+                pac::spc::LpCfgCoreldoVddDs::Normal
             }
         };
         let lvl = match self.config.vdd_power.low_power_mode.level {
@@ -1406,6 +1371,7 @@ impl ClockOperator<'_> {
 
         // NOTE(AJM): I don't really know if this is valid! I'm guessing in most cases you would want to
         // use the low drive strength for lp mode, and high drive strength for active mode?
+        let bgap = calc::bandgap_enabled(self.config.vdd_power.active_mode.drive);
         match self.config.vdd_power.active_mode.drive {
             VddDriveStrength::Low { enable_bandgap } => {
                 // If the bandgap is enabled, also enable the high/low voltage
@@ -1428,11 +1394,11 @@ impl ClockOperator<'_> {
                     }
                 });
 
-                self.clocks.bandgap_active = enable_bandgap;
+                self.clocks.bandgap_active = bgap;
             }
             VddDriveStrength::Normal => {
                 // Already set to normal above
-                self.clocks.bandgap_active = true;
+                self.clocks.bandgap_active = bgap;
             }
         }
 
