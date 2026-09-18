@@ -2347,6 +2347,13 @@ const _: () = {
     // Placeholder helpers.
     assert_valid(NoConfig.validate(clocks));
     assert_valid(Clk1MConfig::new().validate(clocks));
+
+    // WWDT1: clk_1m is 1 MHz, fmax (mid drive) is 1 MHz, div is 1.
+    // 1 <= 1 x 1 (100%).
+    // This also asserts that `clk_1m` survives deep sleep in this
+    // configuration, which WWDT1 requires.
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(Clk1MConfig::for_wwdt(1).validate(clocks));
     // NOTE: `UnimplementedConfig` is deliberately NOT asserted here - failing
     // validation is its entire contract.
 
@@ -2505,6 +2512,13 @@ const _: () = {
 /// pass `validate` against [`PERFORMANCE_VALIDATION_CLOCKS`].
 const _: () = {
     let clocks = &PERFORMANCE_VALIDATION_CLOCKS;
+
+    // WWDT1: clk_1m is 1 MHz, fmax (normal drive) is 1 MHz, div is 1.
+    // 1 <= 1 x 1 (100%).
+    // This also asserts that `clk_1m` survives deep sleep in this
+    // configuration, which WWDT1 requires.
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(Clk1MConfig::for_wwdt(1).validate(clocks));
 
     // DAC (2xx): fro_hf_div is 60 MHz, fmax (over drive) is 60 MHz, div is 1.
     // 60 <= 60 (100%).
