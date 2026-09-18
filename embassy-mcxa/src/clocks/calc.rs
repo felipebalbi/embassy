@@ -16,13 +16,13 @@ use super::program::Osc32KProgram;
 use super::program::SoscProgram;
 use super::program::{
     ActiveDrive, ActiveProgram, FircProgram, Fro16KProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram,
-    SircProgram, VoltageProgram,
+    SircProgram, SpllProgram, VoltageProgram,
 };
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::ClockLimits;
-use crate::pac::scg::Fircsten;
 #[cfg(not(feature = "sosc-as-gpio"))]
 use crate::pac::scg::{Erefs, Range};
+use crate::pac::scg::{Fircsten, Source, Spllsten};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -901,6 +901,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     //
     // SPLL: mirrors `configure_spll`.
     //
+    let mut spll_program = SpllProgram::Absent;
     if let Some(cfg) = config.spll.as_ref() {
         // `configure_spll` performs this check via `ensure_ldo_active`.
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, cfg.power) {
@@ -911,11 +912,11 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         }
 
         // match on the source, ensure it is active already
-        let (src, missing) = match cfg.source {
+        let (src, missing, variant) = match cfg.source {
             #[cfg(not(feature = "sosc-as-gpio"))]
-            SpllSource::Sosc => (clocks.clk_in.as_ref(), "sosc not active"),
-            SpllSource::Firc => (clocks.clk_hf_fundamental.as_ref(), "firc not active"),
-            SpllSource::Sirc => (clocks.fro_12m.as_ref(), "sirc not active"),
+            SpllSource::Sosc => (clocks.clk_in.as_ref(), "sosc not active", Source::Sosc),
+            SpllSource::Firc => (clocks.clk_hf_fundamental.as_ref(), "firc not active", Source::Firc),
+            SpllSource::Sirc => (clocks.fro_12m.as_ref(), "sirc not active", Source::Sirc),
         };
         // This checks if active
         let Some(clk) = src else {
@@ -945,13 +946,26 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         let fout: Option<u32>;
         let fcco: Option<u32>;
 
+        // These are calculated differently depending on the mode.
+        let bp_pre: bool;
+        let bp_post: bool;
+        let bp_post2: bool;
+        let m: u16;
+        let p: Option<u8>;
+        let n: Option<u8>;
+
         match cfg.mode {
             // Fout = M x Fin
             SpllMode::Mode1a { m_mult } => {
-                match check_spll_m(m_mult) {
-                    Ok(_) => {}
+                bp_pre = true;
+                bp_post = true;
+                bp_post2 = false;
+                m = match check_spll_m(m_mult) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
+                };
+                p = None;
+                n = None;
                 fcco = checked_spll_multiply(f_in, m_mult);
                 fout = fcco;
             }
@@ -962,28 +976,36 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 p_div,
                 bypass_p2_div,
             } => {
-                match check_spll_m(m_mult) {
-                    Ok(_) => {}
+                bp_pre = true;
+                bp_post = false;
+                bp_post2 = bypass_p2_div;
+                m = match check_spll_m(m_mult) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
-                match check_spll_p(p_div) {
-                    Ok(_) => {}
+                };
+                p = Some(match check_spll_p(p_div) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
+                });
+                n = None;
                 let div = spll_post_divisor(p_div, bypass_p2_div);
                 fcco = checked_spll_multiply(f_in, m_mult);
                 fout = checked_spll_divide_then_multiply(f_in, div, m_mult);
             }
             // Fout = (M / N) x Fin
             SpllMode::Mode1c { m_mult, n_div } => {
-                match check_spll_m(m_mult) {
-                    Ok(_) => {}
+                bp_pre = false;
+                bp_post = true;
+                bp_post2 = false;
+                m = match check_spll_m(m_mult) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
-                match check_spll_n(n_div) {
-                    Ok(_) => {}
+                };
+                p = None;
+                n = Some(match check_spll_n(n_div) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
+                });
                 fcco = checked_spll_divide_then_multiply(f_in, n_div as u32, m_mult);
                 fout = fcco;
             }
@@ -995,18 +1017,22 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 p_div,
                 bypass_p2_div,
             } => {
-                match check_spll_m(m_mult) {
-                    Ok(_) => {}
+                bp_pre = false;
+                bp_post = false;
+                bp_post2 = bypass_p2_div;
+                m = match check_spll_m(m_mult) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
-                match check_spll_p(p_div) {
-                    Ok(_) => {}
+                };
+                p = Some(match check_spll_p(p_div) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
-                match check_spll_n(n_div) {
-                    Ok(_) => {}
+                });
+                n = Some(match check_spll_n(n_div) {
+                    Ok(v) => v,
                     Err(e) => return Err(e),
-                }
+                });
+                // This can't overflow: u8 x u8 (x 2) always fits in u32
                 let div = spll_pre_post_divisor(n_div, p_div, bypass_p2_div);
                 fcco = checked_spll_divide_then_multiply(f_in, n_div as u32, m_mult);
                 fout = checked_spll_divide_then_multiply(f_in, div, m_mult);
@@ -1049,6 +1075,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
             power: cfg.power,
         });
 
+        let mut pll1_clk_div_bits = None;
         if let Some(d) = cfg.pll1_clk_div.as_ref() {
             let exp_freq = divided_frequency(fout, *d);
             match validate_max_frequency(exp_freq, limits.pll1_clk_div, "pll1_clk_div", "exceeds max frequency") {
@@ -1059,7 +1086,34 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 frequency: exp_freq,
                 power: cfg.power,
             });
+            pll1_clk_div_bits = Some(d.into_bits());
         }
+
+        spll_program = SpllProgram::Enabled {
+            source: variant,
+            selp: spll_selp(m) as u8,
+            seli: spll_seli(m) as u8,
+            // SELR must be 0.
+            selr: 0,
+            m,
+            n,
+            p,
+            bp_pre,
+            bp_post,
+            bp_post2,
+            // SPLLLOCK_CNFG: The lock time programmed in this register must be
+            // equal to meet the PLL 500us lock time plus the 300 refclk count startup.
+            //
+            // LOCK_TIME = 500us/T ref + 300, F ref = F in /N (input frequency divided by pre-divider ratio).
+            //
+            // 500us is 1/2000th of a second, therefore Fref / 2000 is the number of cycles in 500us.
+            lock_time: spll_lock_time(f_in, n),
+            spllsten: match cfg.power {
+                PoweredClock::NormalEnabledDeepSleepDisabled => Spllsten::DisabledInStop,
+                PoweredClock::AlwaysEnabled => Spllsten::EnabledInStop,
+            },
+            pll1_clk_div_bits,
+        };
     }
 
     //
@@ -1136,5 +1190,6 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         osc32k: osc32k_program,
         #[cfg(not(feature = "sosc-as-gpio"))]
         sosc: sosc_program,
+        spll: spll_program,
     })
 }

@@ -15,7 +15,7 @@ use crate::pac;
 use crate::pac::cmc::Ckmode;
 use crate::pac::scg::{
     Fircacc, FircaccIe, FirccsrLk, Fircerr, FircerrIe, Fircsten, Scs, SirccsrLk, Sircerr, Sircvld, SosccsrLk, Soscerr,
-    Source, SpllLock, SpllcsrLk, Spllerr, Spllsten, TrimUnlock,
+    SpllLock, SpllcsrLk, Spllerr, TrimUnlock,
 };
 use crate::pac::spc::{ActiveCfgCoreldoVddDs, LpCfgBgmode};
 use crate::pac::syscon::{
@@ -546,6 +546,8 @@ impl ClockOperator<'_> {
     }
 
     pub(super) fn configure_spll(&mut self) -> Result<(), ClockError> {
+        use super::program::SpllProgram;
+
         // # Vocab
         //
         // | Name   | Meaning                                                     |
@@ -562,7 +564,22 @@ impl ClockOperator<'_> {
         // | Tpon   | PLL start-up time                                           |
 
         // No PLL? Nothing to do!
-        let Some(cfg) = self.config.spll.as_ref() else {
+        let SpllProgram::Enabled {
+            source,
+            selp,
+            seli,
+            selr,
+            m,
+            n,
+            p,
+            bp_pre,
+            bp_post,
+            bp_post2,
+            lock_time,
+            spllsten,
+            pll1_clk_div_bits,
+        } = self.resolved.spll
+        else {
             return Ok(());
         };
 
@@ -571,200 +588,25 @@ impl ClockOperator<'_> {
         // NOTE: the bandgap requirement is enforced during resolution, before we get here.
         self.ensure_ldo_active();
 
-        // match on the source, ensure it is active already
-        let res = match cfg.source {
-            #[cfg(not(feature = "sosc-as-gpio"))]
-            config::SpllSource::Sosc => self
-                .clocks
-                .clk_in
-                .as_ref()
-                .map(|c| (c, Source::Sosc))
-                .ok_or("sosc not active"),
-            config::SpllSource::Firc => self
-                .clocks
-                .clk_hf_fundamental
-                .as_ref()
-                .map(|c| (c, Source::Firc))
-                .ok_or("firc not active"),
-            config::SpllSource::Sirc => self
-                .clocks
-                .fro_12m
-                .as_ref()
-                .map(|c| (c, Source::Sirc))
-                .ok_or("sirc not active"),
-        };
-        // This checks if active
-        let (clk, variant) = res.map_err(|s| ClockError::BadConfig {
-            clock: "spll",
-            reason: s,
-        })?;
-        // This checks the correct power reqs
-        if !clk.power.meets_requirement_of(&cfg.power) {
-            return Err(ClockError::BadConfig {
-                clock: "spll",
-                reason: "needs low power source",
-            });
-        }
-
-        // Bandwidth calc
-        //
-        // > In normal applications, you must calculate the bandwidth manually by using the feedback divider M (ranging from 1 to (2^16)-1),
-        // > Equation 1, and Equation 2. The PLL is automatically stable in such case. In normal applications, SPLLCTRL[BANDDIRECT] must
-        // > be 0; in this case, the bandwidth changes as a function of M.
-        if clk.frequency == 0 {
-            return Err(ClockError::BadConfig {
-                clock: "spll",
-                reason: "internal error",
-            });
-        }
-
-        // These are calculated differently depending on the mode.
-        let f_in = clk.frequency;
-        let bp_pre: bool;
-        let bp_post: bool;
-        let bp_post2: bool;
-        let m: u16;
-        let p: Option<u8>;
-        let n: Option<u8>;
-
-        // Calculate both Fout and Fcco so we can ensure they don't overflow
-        // and are in range
-        let fout: Option<u32>;
-        let fcco: Option<u32>;
-
-        match cfg.mode {
-            // Fout = M x Fin
-            config::SpllMode::Mode1a { m_mult } => {
-                bp_pre = true;
-                bp_post = true;
-                bp_post2 = false;
-                m = match calc::check_spll_m(m_mult) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
-                p = None;
-                n = None;
-                fcco = calc::checked_spll_multiply(f_in, m_mult);
-                fout = fcco;
-            }
-            // if !bypass_p2_div: Fout = (M / (2 x P)) x Fin
-            // if  bypass_p2_div: Fout = (M /    P   ) x Fin
-            config::SpllMode::Mode1b {
-                m_mult,
-                p_div,
-                bypass_p2_div,
-            } => {
-                bp_pre = true;
-                bp_post = false;
-                bp_post2 = bypass_p2_div;
-                m = match calc::check_spll_m(m_mult) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
-                p = Some(match calc::check_spll_p(p_div) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                });
-                n = None;
-                let div = calc::spll_post_divisor(p_div, bypass_p2_div);
-                fcco = calc::checked_spll_multiply(f_in, m_mult);
-                fout = calc::checked_spll_divide_then_multiply(f_in, div, m_mult);
-            }
-            // Fout = (M / N) x Fin
-            config::SpllMode::Mode1c { m_mult, n_div } => {
-                bp_pre = false;
-                bp_post = true;
-                bp_post2 = false;
-                m = match calc::check_spll_m(m_mult) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
-                p = None;
-                n = Some(match calc::check_spll_n(n_div) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                });
-                fcco = calc::checked_spll_divide_then_multiply(f_in, n_div as u32, m_mult);
-                fout = fcco;
-            }
-            // if !bypass_p2_div: Fout = (M / (N x 2 x P)) x Fin
-            // if  bypass_p2_div: Fout = (M / (  N x P  )) x Fin
-            config::SpllMode::Mode1d {
-                m_mult,
-                n_div,
-                p_div,
-                bypass_p2_div,
-            } => {
-                bp_pre = false;
-                bp_post = false;
-                bp_post2 = bypass_p2_div;
-                m = match calc::check_spll_m(m_mult) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
-                p = Some(match calc::check_spll_p(p_div) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                });
-                n = Some(match calc::check_spll_n(n_div) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                });
-                // This can't overflow: u8 x u8 (x 2) always fits in u32
-                let div = calc::spll_pre_post_divisor(n_div, p_div, bypass_p2_div);
-                fcco = calc::checked_spll_divide_then_multiply(f_in, n_div as u32, m_mult);
-                fout = calc::checked_spll_divide_then_multiply(f_in, div, m_mult);
-            }
-        };
+        // NOTE: source selection, the mode arithmetic (Fout/Fcco), and every
+        // frequency-limit check are all performed during resolution, before we
+        // get here.
 
         // Dump all the PLL calcs if needed for debugging
         #[cfg(feature = "defmt")]
         {
-            defmt::debug!("f_in: {:?}", f_in);
             defmt::debug!("bp_pre: {:?}", bp_pre);
             defmt::debug!("bp_post: {:?}", bp_post);
             defmt::debug!("bp_post2: {:?}", bp_post2);
             defmt::debug!("m: {:?}", m);
             defmt::debug!("p: {:?}", p);
             defmt::debug!("n: {:?}", n);
-            defmt::debug!("fout: {:?}", fout);
-            defmt::debug!("fcco: {:?}", fcco);
         }
-
-        // Ensure the Fcco and Fout calcs didn't overflow
-        let fcco = match calc::require_spll_fcco(fcco) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        let fout = match calc::require_spll_fout(fout) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-
-        // Fcco: 275MHz to 550MHz
-        match calc::validate_spll_fcco(fcco) {
-            Ok(()) => {}
-            Err(e) => return Err(e),
-        }
-
-        let limits = self.lowest_relevant_limits(&cfg.power);
-
-        // Fout: 4.3MHz to 2x Max CPU Frequency
-        match calc::validate_spll_fout(fout, limits) {
-            Ok(()) => {}
-            Err(e) => return Err(e),
-        }
-
-        let selp = calc::spll_selp(m);
-
-        let seli = calc::spll_seli(m);
-        // SELR must be 0.
-        let selr = 0;
 
         self.scg0.spllctrl().modify(|w| {
-            w.set_source(variant);
-            w.set_selp(selp as u8);
-            w.set_seli(seli as u8);
+            w.set_source(source);
+            w.set_selp(selp);
+            w.set_seli(seli);
             w.set_selr(selr);
         });
 
@@ -796,29 +638,9 @@ impl ClockOperator<'_> {
             w.set_trim_unlock(TrimUnlock::NotLocked)
         });
 
-        // SPLLLOCK_CNFG: The lock time programmed in this register must be
-        // equal to meet the PLL 500μs lock time plus the 300 refclk count startup.
-        //
-        // LOCK_TIME = 500μs/T ref + 300, F ref = F in /N (input frequency divided by pre-divider ratio).
-        //
-        // 500us is 1/2000th of a second, therefore Fref / 2000 is the number of cycles in 500us.
-        let lock_time = calc::spll_lock_time(f_in, n);
         self.scg0.splllock_cnfg().write(|w| w.set_lock_time(lock_time));
 
         // TODO: Support Spread spectrum?
-
-        let bg_good =
-            calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, cfg.power);
-        let spllsten: Spllsten = match cfg.power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => Spllsten::DisabledInStop,
-            PoweredClock::AlwaysEnabled => Spllsten::EnabledInStop,
-        };
-        if !bg_good {
-            return Err(ClockError::BadConfig {
-                clock: "spll",
-                reason: "bandgap required when active",
-            });
-        }
 
         self.scg0.spllcsr().modify(|w| {
             w.set_spllclken(true);
@@ -844,24 +666,15 @@ impl ClockOperator<'_> {
         self.scg0.spllcsr().modify(|w| w.set_lk(SpllcsrLk::WriteDisabled));
 
         // Store clock state
-        self.clocks.pll1_clk = Some(Clock {
-            frequency: fout,
-            power: cfg.power,
-        });
+        self.clocks.pll1_clk = self.resolved.clocks.pll1_clk.clone();
 
         // Do we enable the `pll1_clk_div` output?
-        if let Some(d) = cfg.pll1_clk_div.as_ref() {
-            let exp_freq = calc::divided_frequency(fout, *d);
-            match calc::validate_max_frequency(exp_freq, limits.pll1_clk_div, "pll1_clk_div", "exceeds max frequency") {
-                Ok(()) => {}
-                Err(e) => return Err(e),
-            }
-
+        if let Some(div) = pll1_clk_div_bits {
             // Halt and reset the div; then set our desired div.
             self.syscon.pll1clkdiv().write(|w| {
                 w.set_halt(Pll1clkdivHalt::Halt);
                 w.set_reset(Pll1clkdivReset::Asserted);
-                w.set_div(d.into_bits());
+                w.set_div(div);
             });
             // Then unhalt it, and reset it
             //
@@ -873,17 +686,14 @@ impl ClockOperator<'_> {
             self.syscon.pll1clkdiv().write(|w| {
                 w.set_halt(Pll1clkdivHalt::Run);
                 w.set_reset(Pll1clkdivReset::Released);
-                w.set_div(d.into_bits());
+                w.set_div(div);
             });
 
             // Wait for clock to stabilize
             while self.syscon.pll1clkdiv().read().unstab() == Pll1clkdivUnstab::Ongoing {}
 
             // Store off the clock info
-            self.clocks.pll1_clk_div = Some(Clock {
-                frequency: exp_freq,
-                power: cfg.power,
-            });
+            self.clocks.pll1_clk_div = self.resolved.clocks.pll1_clk_div.clone();
         }
 
         Ok(())

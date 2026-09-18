@@ -14,7 +14,7 @@ use super::config::CoreSleep;
 use super::types::Clocks;
 #[cfg(not(feature = "sosc-as-gpio"))]
 use crate::pac::scg::{Erefs, Range};
-use crate::pac::scg::{Fircsten, FreqSel};
+use crate::pac::scg::{Fircsten, FreqSel, Source, Spllsten};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -39,6 +39,55 @@ pub(super) struct ResolvedClockProgram {
     /// The values `configure_sosc` needs.
     #[cfg(not(feature = "sosc-as-gpio"))]
     pub(super) sosc: SoscProgram,
+    /// The values `configure_spll` needs.
+    pub(super) spll: SpllProgram,
+}
+
+/// Everything `configure_spll` derives from the configuration.
+///
+/// The four SPLL modes are normalised into a single enabled program: each mode
+/// only differs in which of `n`/`p` are present and in the three bypass flags,
+/// so keeping per-mode variants would leave fields unread.
+pub(super) enum SpllProgram {
+    /// No SPLL configuration was requested; `configure_spll` touches no registers.
+    Absent,
+    /// An SPLL configuration was requested.
+    ///
+    /// The resulting frequency and power live in
+    /// [`ResolvedClockProgram::clocks`], as `pll1_clk` / `pll1_clk_div`. `Fcco` is
+    /// range-checked during resolution and is deliberately not carried here.
+    Enabled {
+        /// `SPLLCTRL[SOURCE]`.
+        source: Source,
+        /// `SPLLCTRL[SELP]`.
+        selp: u8,
+        /// `SPLLCTRL[SELI]`.
+        seli: u8,
+        /// `SPLLCTRL[SELR]`.
+        selr: u8,
+        /// `SPLLMDIV[MDIV]`.
+        m: u16,
+        /// `SPLLNDIV[NDIV]`. `None` skips that write entirely.
+        n: Option<u8>,
+        /// `SPLLPDIV[PDIV]`. `None` skips that write entirely.
+        p: Option<u8>,
+        /// `SPLLCTRL[BYPASSPREDIV]`.
+        bp_pre: bool,
+        /// `SPLLCTRL[BYPASSPOSTDIV]`.
+        bp_post: bool,
+        /// `SPLLCTRL[BYPASSPOSTDIV2]`.
+        bp_post2: bool,
+        /// `SPLLLOCK_CNFG[LOCK_TIME]`.
+        lock_time: u32,
+        /// `SPLLCSR[SPLLSTEN]`.
+        spllsten: Spllsten,
+        /// `SYSCON[PLL1CLKDIV.DIV]`, if the `pll1_clk_div` output is enabled.
+        ///
+        /// NOTE: BOTH `PLL1CLKDIV` writes must set `DIV` from this value. The
+        /// second write is a `write()`, so omitting it silently resets the
+        /// divisor to divide-by-1.
+        pll1_clk_div_bits: Option<u8>,
+    },
 }
 
 /// Everything `configure_sosc` derives from the configuration.
