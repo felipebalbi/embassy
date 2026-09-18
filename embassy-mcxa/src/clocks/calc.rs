@@ -9,8 +9,8 @@ use super::config::{
     ClocksConfig, Div8, FircFreqSel, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
 };
 use super::program::{
-    ActiveDrive, ActiveProgram, FircProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram, SircProgram,
-    VoltageProgram,
+    ActiveDrive, ActiveProgram, FircProgram, Fro16KProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram,
+    SircProgram, VoltageProgram,
 };
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::ClockLimits;
@@ -671,14 +671,28 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     //
     // FRO16K: mirrors `configure_fro16k_clocks`.
     //
+    // NOTE: `enable` reflects configuration *presence*, not whether any output
+    // domain is active: a config with all domains disabled still sets `FRO_EN`
+    // while leaving every `clk_16k_*` clock `None`.
+    let mut fro16k_program = Fro16KProgram {
+        enable: config.fro16k.is_some(),
+        clke: None,
+    };
     if let Some(fro16k) = config.fro16k.as_ref() {
+        // Enable clock outputs to both VSYS and VDD_CORE domains
+        // Bit 0: clk_16k0 to VSYS domain
+        // Bit 1: clk_16k1 to VDD_CORE/CORE_MAIN domain
+        // Bit 2: clk_16k2 to VBAT domain (5xx only)
+        let mut bits = 0u8;
         if fro16k.vsys_domain_active {
+            bits |= 0b01;
             clocks.clk_16k_vsys = Some(Clock {
                 frequency: FRO_16K_FREQUENCY,
                 power: PoweredClock::AlwaysEnabled,
             });
         }
         if fro16k.vdd_core_domain_active {
+            bits |= 0b10;
             clocks.clk_16k_vdd_core = Some(Clock {
                 frequency: FRO_16K_FREQUENCY,
                 power: PoweredClock::AlwaysEnabled,
@@ -686,11 +700,13 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         }
         #[cfg(feature = "mcxa5xx")]
         if fro16k.vbat_domain_active {
+            bits |= 0b100;
             clocks.clk_16k_vbat = Some(Clock {
                 frequency: FRO_16K_FREQUENCY,
                 power: PoweredClock::AlwaysEnabled,
             });
         }
+        fro16k_program.clke = Some(bits);
     }
 
     //
@@ -996,5 +1012,6 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         voltage,
         sirc,
         firc: firc_program,
+        fro16k: fro16k_program,
     })
 }

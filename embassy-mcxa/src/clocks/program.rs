@@ -27,6 +27,22 @@ pub(super) struct ResolvedClockProgram {
     pub(super) sirc: SircProgram,
     /// The values `configure_firc_clocks` needs.
     pub(super) firc: FircProgram,
+    /// The values `configure_fro16k_clocks` needs.
+    pub(super) fro16k: Fro16KProgram,
+}
+
+/// Everything `configure_fro16k_clocks` derives from the configuration.
+pub(super) struct Fro16KProgram {
+    /// `VBAT0[FROCTLA.FRO_EN]`.
+    ///
+    /// NOTE: this reflects the *presence* of a FRO16K configuration, which is NOT
+    /// the same as "some output domain is active": a configuration with all
+    /// domains disabled still enables the oscillator while gating every output.
+    pub(super) enable: bool,
+    /// `VBAT0[FROCLKE.CLKE]`, the output-gate bitmask, if a FRO16K configuration
+    /// was requested. `None` makes `configure_fro16k_clocks` return early before
+    /// the `FROCLKE` write.
+    pub(super) clke: Option<u8>,
 }
 
 /// Everything `configure_firc_clocks` derives from the configuration.

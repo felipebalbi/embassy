@@ -3,7 +3,7 @@
 //! This module contains the private `ClockOperator` struct and all of its
 //! `configure_*` methods. It is only used during [`super::init()`].
 
-use config::{ClocksConfig, CoreSleep, Fro16KConfig, MainClockSource, VddLevel};
+use config::{ClocksConfig, CoreSleep, MainClockSource, VddLevel};
 use cortex_m::peripheral::SCB;
 
 use super::calc;
@@ -280,53 +280,30 @@ impl ClockOperator<'_> {
     /// Configure the ROSC/FRO16K/clk_16k clock family
     pub(super) fn configure_fro16k_clocks(&mut self) -> Result<(), ClockError> {
         // If we have a config: ensure fro16k is enabled. If not: ensure it is disabled.
-        let enable = self.config.fro16k.is_some();
+        let enable = self.resolved.fro16k.enable;
         self.vbat0.froctla().modify(|w| w.set_fro_en(enable));
 
         // Lock the control register
         self.vbat0.frolcka().modify(|w| w.set_lock(true));
 
         // If we're disabled, we're done!
-        let Some(fro16k) = self.config.fro16k.as_ref() else {
+        let Some(bits) = self.resolved.fro16k.clke else {
             return Ok(());
         };
 
         // Enabled, now set up.
-        let Fro16KConfig {
-            vsys_domain_active,
-            vdd_core_domain_active,
-            #[cfg(feature = "mcxa5xx")]
-            vbat_domain_active,
-        } = fro16k;
-
+        //
         // Enable clock outputs to both VSYS and VDD_CORE domains
         // Bit 0: clk_16k0 to VSYS domain
         // Bit 1: clk_16k1 to VDD_CORE/CORE_MAIN domain
         // Bit 2: clk_16k2 to VBAT domain (5xx only)
         //
         // TODO: Define sub-fields for this register with a PAC patch?
-        let mut bits = 0;
-        if *vsys_domain_active {
-            bits |= 0b01;
-            self.clocks.clk_16k_vsys = Some(Clock {
-                frequency: calc::FRO_16K_FREQUENCY,
-                power: PoweredClock::AlwaysEnabled,
-            });
-        }
-        if *vdd_core_domain_active {
-            bits |= 0b10;
-            self.clocks.clk_16k_vdd_core = Some(Clock {
-                frequency: calc::FRO_16K_FREQUENCY,
-                power: PoweredClock::AlwaysEnabled,
-            });
-        }
+        self.clocks.clk_16k_vsys = self.resolved.clocks.clk_16k_vsys.clone();
+        self.clocks.clk_16k_vdd_core = self.resolved.clocks.clk_16k_vdd_core.clone();
         #[cfg(feature = "mcxa5xx")]
-        if *vbat_domain_active {
-            bits |= 0b100;
-            self.clocks.clk_16k_vbat = Some(Clock {
-                frequency: calc::FRO_16K_FREQUENCY,
-                power: PoweredClock::AlwaysEnabled,
-            });
+        {
+            self.clocks.clk_16k_vbat = self.resolved.clocks.clk_16k_vbat.clone();
         }
         self.vbat0.froclke().modify(|w| w.set_clke(bits));
 
