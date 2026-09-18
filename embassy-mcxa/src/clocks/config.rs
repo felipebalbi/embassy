@@ -155,6 +155,31 @@ impl ClocksConfig {
     pub const fn resolve(&self) -> Result<Clocks, ClockError> {
         super::calc::resolve(self)
     }
+
+    /// Create the default configuration.
+    ///
+    /// This returns the same values as the [`Default`] implementation, but is a
+    /// `const fn`, so it may be used to build a configuration in `const` context.
+    /// It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
+        Self {
+            vdd_power: VddPowerConfig::new(),
+            main_clock: MainClockConfig {
+                source: MainClockSource::FircHfRoot,
+                power: PoweredClock::NormalEnabledDeepSleepDisabled,
+                ahb_clk_div: Div8::no_div(),
+            },
+            firc: Some(FircConfig::new()),
+            sirc: SircConfig::new(),
+            fro16k: Some(Fro16KConfig::new()),
+            #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+            osc32k: None,
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            sosc: None,
+            spll: None,
+        }
+    }
 }
 
 // Power (which is not a clock)
@@ -192,6 +217,20 @@ pub struct VddModeConfig {
     pub level: VddLevel,
     /// VDD_CORE/LDO_CORE drive strength
     pub drive: VddDriveStrength,
+}
+
+impl VddModeConfig {
+    /// Create the default configuration.
+    ///
+    /// This is a `const fn`, so it may be used to build a configuration in `const`
+    /// context. It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
+        Self {
+            level: VddLevel::MidDriveMode,
+            drive: VddDriveStrength::Normal,
+        }
+    }
 }
 
 /// Settings for gating power to on-chip flash
@@ -290,6 +329,22 @@ pub struct VddPowerConfig {
     pub core_sleep: CoreSleep,
     /// Internal flash clock gating settings
     pub flash_sleep: FlashSleep,
+}
+
+impl VddPowerConfig {
+    /// Create the default configuration.
+    ///
+    /// This is a `const fn`, so it may be used to build a configuration in `const`
+    /// context. It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
+        Self {
+            active_mode: VddModeConfig::new(),
+            low_power_mode: VddModeConfig::new(),
+            core_sleep: CoreSleep::WfeUngated,
+            flash_sleep: FlashSleep::Never,
+        }
+    }
 }
 
 // Main Clock
@@ -558,6 +613,21 @@ pub struct SircConfig {
     pub fro_lf_div: Option<Div8>,
 }
 
+impl SircConfig {
+    /// Create the default configuration.
+    ///
+    /// This is a `const fn`, so it may be used to build a configuration in `const`
+    /// context. It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
+        Self {
+            power: PoweredClock::AlwaysEnabled,
+            fro_12m_enabled: true,
+            fro_lf_div: None,
+        }
+    }
+}
+
 /// FRO16K Configuration items
 #[non_exhaustive]
 pub struct Fro16KConfig {
@@ -570,14 +640,26 @@ pub struct Fro16KConfig {
     pub vbat_domain_active: bool,
 }
 
-impl Default for Fro16KConfig {
-    fn default() -> Self {
+impl Fro16KConfig {
+    /// Create the default configuration.
+    ///
+    /// This returns the same values as the [`Default`] implementation, but is a
+    /// `const fn`, so it may be used to build a configuration in `const` context.
+    /// It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
         Self {
             vsys_domain_active: true,
             vdd_core_domain_active: true,
             #[cfg(feature = "mcxa5xx")]
             vbat_domain_active: true,
         }
+    }
+}
+
+impl Default for Fro16KConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -667,8 +749,14 @@ pub struct Osc32KConfig {
 }
 
 #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
-impl Default for Osc32KConfig {
-    fn default() -> Self {
+impl Osc32KConfig {
+    /// Create the default configuration.
+    ///
+    /// This returns the same values as the [`Default`] implementation, but is a
+    /// `const fn`, so it may be used to build a configuration in `const` context.
+    /// It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
         Self {
             mode: Osc32KMode::LowPower {
                 coarse_amp_gain: Osc32KCoarseGain::EsrRange0,
@@ -681,9 +769,22 @@ impl Default for Osc32KConfig {
     }
 }
 
-impl Default for FircConfig {
+#[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
+impl Default for Osc32KConfig {
     fn default() -> Self {
-        FircConfig {
+        Self::new()
+    }
+}
+
+impl FircConfig {
+    /// Create the default configuration.
+    ///
+    /// This returns the same values as the [`Default`] implementation, but is a
+    /// `const fn`, so it may be used to build a configuration in `const` context.
+    /// It also allows construction from outside this crate, which the
+    /// `#[non_exhaustive]` attribute would otherwise prevent.
+    pub const fn new() -> Self {
+        Self {
             #[cfg(feature = "mcxa2xx")]
             frequency: FircFreqSel::Mhz45,
             #[cfg(feature = "mcxa5xx")]
@@ -696,52 +797,14 @@ impl Default for FircConfig {
     }
 }
 
+impl Default for FircConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for ClocksConfig {
     fn default() -> Self {
-        Self {
-            vdd_power: VddPowerConfig {
-                active_mode: VddModeConfig {
-                    level: VddLevel::MidDriveMode,
-                    drive: VddDriveStrength::Normal,
-                },
-                low_power_mode: VddModeConfig {
-                    level: VddLevel::MidDriveMode,
-                    drive: VddDriveStrength::Normal,
-                },
-                core_sleep: CoreSleep::WfeUngated,
-                flash_sleep: FlashSleep::Never,
-            },
-            main_clock: MainClockConfig {
-                source: MainClockSource::FircHfRoot,
-                power: PoweredClock::NormalEnabledDeepSleepDisabled,
-                ahb_clk_div: Div8::no_div(),
-            },
-            firc: Some(FircConfig {
-                #[cfg(feature = "mcxa2xx")]
-                frequency: FircFreqSel::Mhz45,
-                #[cfg(feature = "mcxa5xx")]
-                frequency: FircFreqSel::Mhz48,
-                power: PoweredClock::NormalEnabledDeepSleepDisabled,
-                fro_hf_enabled: true,
-                clk_hf_fundamental_enabled: true,
-                fro_hf_div: None,
-            }),
-            sirc: SircConfig {
-                power: PoweredClock::AlwaysEnabled,
-                fro_12m_enabled: true,
-                fro_lf_div: None,
-            },
-            fro16k: Some(Fro16KConfig {
-                vsys_domain_active: true,
-                vdd_core_domain_active: true,
-                #[cfg(feature = "mcxa5xx")]
-                vbat_domain_active: true,
-            }),
-            #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
-            osc32k: None,
-            #[cfg(not(feature = "sosc-as-gpio"))]
-            sosc: None,
-            spll: None,
-        }
+        Self::new()
     }
 }
