@@ -3,14 +3,12 @@
 //! This module contains the private `ClockOperator` struct and all of its
 //! `configure_*` methods. It is only used during [`super::init()`].
 
-use config::{
-    ClocksConfig, CoreSleep, FircConfig, FircFreqSel, Fro16KConfig, MainClockSource, SircConfig, VddDriveStrength,
-    VddLevel,
-};
+use config::{ClocksConfig, CoreSleep, FircConfig, FircFreqSel, Fro16KConfig, MainClockSource, SircConfig, VddLevel};
 use cortex_m::peripheral::SCB;
 
 use super::calc;
 use super::config;
+use super::program::{ActiveDrive, LowPowerDrive, ResolvedClockProgram};
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::{ClockLimits, clock_limits};
 use crate::pac;
@@ -19,9 +17,7 @@ use crate::pac::scg::{
     Erefs, Fircacc, FircaccIe, FirccsrLk, Fircerr, FircerrIe, Fircsten, Range, Scs, SirccsrLk, Sircerr, Sircvld,
     SosccsrLk, Soscerr, Source, SpllLock, SpllcsrLk, Spllerr, Spllsten, TrimUnlock,
 };
-use crate::pac::spc::{
-    ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgBgmode, LpCfgCoreldoVddLvl, Vsm,
-};
+use crate::pac::spc::{ActiveCfgCoreldoVddDs, LpCfgBgmode};
 use crate::pac::syscon::{
     AhbclkdivUnstab, FrohfdivHalt, FrohfdivReset, FrohfdivUnstab, FrolfdivHalt, FrolfdivReset, FrolfdivUnstab,
     Pll1clkdivHalt, Pll1clkdivReset, Pll1clkdivUnstab, Unlock,
@@ -40,6 +36,8 @@ pub(super) struct ClockOperator<'a> {
     pub(super) clocks: &'a mut Clocks,
     /// A reference to the requested configuration provided by the caller of [`init()`](super::init)
     pub(super) config: &'a ClocksConfig,
+    /// The fully-resolved program that this operator applies to hardware
+    pub(super) resolved: &'a ResolvedClockProgram,
 
     /// SIRC is forced-on until we set `main_clk`
     pub(super) sirc_forced: bool,
@@ -1231,18 +1229,13 @@ impl ClockOperator<'_> {
 
     pub(super) fn configure_voltages(&mut self) -> Result<(), ClockError> {
         // Determine if we need to change the active mode voltage levels
-        let to_change = match self.config.vdd_power.active_mode.level {
-            VddLevel::MidDriveMode => {
-                // This is the default mode, I don't believe we need to do anything.
-                //
-                // "The LVDE and HVDE fields reset only with a POR.
-                // All other fields reset only with a system reset."
-                None
-            }
-            #[cfg(feature = "mcxa5xx")]
-            VddLevel::NormalMode => Some((ActiveCfgCoreldoVddLvl::Normal, Vsm::Sram1v1)),
-            VddLevel::OverDriveMode => Some((ActiveCfgCoreldoVddLvl::Over, Vsm::Sram1v2)),
-        };
+        //
+        // NOTE: In the `MidDriveMode` case this is `None`: that is the default mode,
+        // and we don't believe we need to do anything.
+        //
+        // "The LVDE and HVDE fields reset only with a POR.
+        // All other fields reset only with a system reset."
+        let to_change = self.resolved.voltage.active_level_change;
 
         if let Some((vdd, vsm)) = to_change {
             // You can change the core VDD levels for the LDO_CORE low power regulator only
@@ -1297,26 +1290,9 @@ impl ClockOperator<'_> {
         // the CORELDO_VDD_LVL's in the ACTIVE_CFG and LP_CFG register must be set to the same voltage
         // level settings.
         //
-        // TODO(AJM): I don't really understand this! Enforce it literally for now I guess.
-        let ds_match = calc::vdd_drive_matches(
-            self.config.vdd_power.active_mode.drive,
-            self.config.vdd_power.low_power_mode.drive,
-        );
-        let (vdd_match, lpwkup) = match calc::vdd_level_transition(
-            self.config.vdd_power.active_mode.level,
-            self.config.vdd_power.low_power_mode.level,
-        ) {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+        // NOTE: this condition is enforced during resolution, before we get here.
+        let lpwkup = self.resolved.voltage.lpwkup;
         self.spc0.lpwkup_delay().write(|w| w.set_lpwkup_delay(lpwkup));
-
-        if ds_match && !vdd_match {
-            return Err(ClockError::BadConfig {
-                clock: "vdd_power",
-                reason: "DS matches but LVL mismatches!",
-            });
-        }
 
         // You can change the core VDD levels for the LDO_CORE low power regulator only when
         // ACTIVE_CFG[CORELDO_VDD_DS] = 1. So, before entering any of the low-power states (DSLEEP,
@@ -1330,30 +1306,20 @@ impl ClockOperator<'_> {
         // for low power mode. We'll just configure it, I guess?
         //
         // NOTE(AJM): "LP_CFG: This register resets only after a POR or LVD event."
-        let bgap = calc::bandgap_enabled(self.config.vdd_power.low_power_mode.drive);
-        let ds = match self.config.vdd_power.low_power_mode.drive {
-            VddDriveStrength::Low { enable_bandgap } => {
-                // If the bandgap is enabled, also enable the high/low voltage
-                // detectors. if it is disabled, these must also be disabled.
-                self.spc0.lp_cfg().modify(|w| {
-                    w.set_sys_hvde(enable_bandgap);
-                    w.set_sys_lvde(enable_bandgap);
-                    w.set_core_lvde(enable_bandgap);
-                });
-
-                pac::spc::LpCfgCoreldoVddDs::Low
-            }
-            VddDriveStrength::Normal => {
-                // "If you specify normal drive strength, you must write a value to LP[BGMODE] that enables the bandgap."
-                pac::spc::LpCfgCoreldoVddDs::Normal
-            }
-        };
-        let lvl = match self.config.vdd_power.low_power_mode.level {
-            VddLevel::MidDriveMode => LpCfgCoreldoVddLvl::Mid,
-            #[cfg(feature = "mcxa5xx")]
-            VddLevel::NormalMode => LpCfgCoreldoVddLvl::Normal,
-            VddLevel::OverDriveMode => LpCfgCoreldoVddLvl::Over,
-        };
+        let bgap = self.resolved.voltage.low_power.bandgap;
+        if let LowPowerDrive::Low { enable_detectors } = self.resolved.voltage.low_power.drive {
+            // If the bandgap is enabled, also enable the high/low voltage
+            // detectors. if it is disabled, these must also be disabled.
+            self.spc0.lp_cfg().modify(|w| {
+                w.set_sys_hvde(enable_detectors);
+                w.set_sys_lvde(enable_detectors);
+                w.set_core_lvde(enable_detectors);
+            });
+        }
+        // NOTE: in the `Normal` drive case:
+        // "If you specify normal drive strength, you must write a value to LP[BGMODE] that enables the bandgap."
+        let ds = self.resolved.voltage.low_power.ds;
+        let lvl = self.resolved.voltage.low_power.level;
         self.spc0.lp_cfg().modify(|w| w.set_coreldo_vdd_ds(ds));
 
         // If we're enabling the bandgap, ensure we do it BEFORE changing the VDD level
@@ -1365,7 +1331,7 @@ impl ClockOperator<'_> {
             self.spc0.lp_cfg().modify(|w| w.set_coreldo_vdd_lvl(lvl));
             self.spc0.lp_cfg().modify(|w| w.set_bgmode(LpCfgBgmode::Bgmode0));
         }
-        self.clocks.bandgap_lowpower = bgap;
+        self.clocks.bandgap_lowpower = self.resolved.clocks.bandgap_lowpower;
 
         // Updating CORELDO_VDD_LVL sets the SC[BUSY] flag. That flag remains set for at least the total time
         // delay that Active Voltage Trim Delay (ACTIVE_VDELAY) specifies.
@@ -1378,34 +1344,29 @@ impl ClockOperator<'_> {
 
         // NOTE(AJM): I don't really know if this is valid! I'm guessing in most cases you would want to
         // use the low drive strength for lp mode, and high drive strength for active mode?
-        let bgap = calc::bandgap_enabled(self.config.vdd_power.active_mode.drive);
-        match self.config.vdd_power.active_mode.drive {
-            VddDriveStrength::Low { enable_bandgap } => {
+        match self.resolved.voltage.active.drive {
+            ActiveDrive::Low {
+                enable_detectors,
+                ds,
+                bgmode,
+            } => {
                 // If the bandgap is enabled, also enable the high/low voltage
                 // detectors. if it is disabled, these must also be disabled.
                 self.spc0.active_cfg().modify(|w| {
-                    w.set_sys_hvde(enable_bandgap);
-                    w.set_sys_lvde(enable_bandgap);
-                    w.set_core_lvde(enable_bandgap);
+                    w.set_sys_hvde(enable_detectors);
+                    w.set_sys_lvde(enable_detectors);
+                    w.set_core_lvde(enable_detectors);
                 });
 
                 // optionally disable bandgap AFTER setting vdd strength to low
-                self.spc0
-                    .active_cfg()
-                    .modify(|w| w.set_coreldo_vdd_ds(ActiveCfgCoreldoVddDs::Low));
-                self.spc0.active_cfg().modify(|w| {
-                    if enable_bandgap {
-                        w.set_bgmode(ActiveCfgBgmode::Bgmode01)
-                    } else {
-                        w.set_bgmode(ActiveCfgBgmode::Bgmode0)
-                    }
-                });
+                self.spc0.active_cfg().modify(|w| w.set_coreldo_vdd_ds(ds));
+                self.spc0.active_cfg().modify(|w| w.set_bgmode(bgmode));
 
-                self.clocks.bandgap_active = bgap;
+                self.clocks.bandgap_active = self.resolved.clocks.bandgap_active;
             }
-            VddDriveStrength::Normal => {
+            ActiveDrive::Normal => {
                 // Already set to normal above
-                self.clocks.bandgap_active = bgap;
+                self.clocks.bandgap_active = self.resolved.clocks.bandgap_active;
             }
         }
 
@@ -1415,7 +1376,7 @@ impl ClockOperator<'_> {
         let mut scb: SCB = unsafe { core::mem::transmute(()) };
 
         // Apply sleep settings
-        match self.config.vdd_power.core_sleep {
+        match self.resolved.voltage.core_sleep {
             CoreSleep::WfeUngated => {
                 // Do not gate
                 self.cmc.ckctrl().modify(|w| w.set_ckmode(Ckmode::Ckmode0000));
@@ -1460,14 +1421,11 @@ impl ClockOperator<'_> {
                 }
             }
         }
-        self.clocks.core_sleep = self.config.vdd_power.core_sleep;
+        self.clocks.core_sleep = self.resolved.voltage.core_sleep;
 
         // Allow automatic gating of the flash memory
-        let (wake, doze) = match self.config.vdd_power.flash_sleep {
-            config::FlashSleep::Never => (false, false),
-            config::FlashSleep::FlashDoze => (false, true),
-            config::FlashSleep::FlashDozeWithFlashWake => (true, true),
-        };
+        let wake = self.resolved.voltage.flash_wake;
+        let doze = self.resolved.voltage.flash_doze;
 
         self.cmc.flashcr().modify(|w| {
             w.set_flashdoze(doze);
@@ -1480,8 +1438,8 @@ impl ClockOperator<'_> {
         self.spc0.lp_cfg1().write(|w| w.0 = 0);
 
         // Update status
-        self.clocks.active_power = self.config.vdd_power.active_mode.level;
-        self.clocks.lp_power = self.config.vdd_power.low_power_mode.level;
+        self.clocks.active_power = self.resolved.clocks.active_power;
+        self.clocks.lp_power = self.resolved.clocks.lp_power;
 
         Ok(())
     }

@@ -48,6 +48,7 @@ pub mod config;
 mod gate;
 mod operator;
 pub mod periph_helpers;
+mod program;
 mod sleep;
 mod types;
 
@@ -231,10 +232,15 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
         }
     })?;
 
+    // Resolve the requested configuration in full *before* touching any hardware.
+    // Everything the operator applies below comes from this result.
+    let resolved = calc::resolve_program(&settings)?;
+
     let mut clocks = Clocks::default();
     let mut operator = operator::ClockOperator {
         clocks: &mut clocks,
         config: &settings,
+        resolved: &resolved,
         sirc_forced: false,
 
         _mrcc0: pac::MRCC0,
@@ -275,7 +281,7 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
     critical_section::with(|cs| {
         let mut clks = CLOCKS.borrow_ref_mut(cs);
         assert!(clks.is_none(), "Clock setup race!");
-        *clks = Some(clocks);
+        *clks = Some(resolved.clocks);
     });
 
     Ok(())

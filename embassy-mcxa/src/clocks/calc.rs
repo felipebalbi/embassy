@@ -5,9 +5,17 @@
 //! from the `configure_*` methods in [`super::operator`] so that they can also
 //! be evaluated at compile time.
 
-use super::config::{ClocksConfig, Div8, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel};
+use super::config::{
+    ClocksConfig, Div8, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
+};
+use super::program::{
+    ActiveDrive, ActiveProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram, VoltageProgram,
+};
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::ClockLimits;
+use crate::pac::spc::{
+    ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
+};
 
 //
 // Frequency constants
@@ -402,14 +410,24 @@ pub(super) const fn vdd_drive_matches(active: VddDriveStrength, low_power: VddDr
 /// the same helpers [`super::operator`] calls — so that the compile-time and run-time
 /// views of the clock tree cannot drift apart.
 pub(super) const fn resolve(config: &ClocksConfig) -> Result<Clocks, ClockError> {
+    match resolve_program(config) {
+        Ok(program) => Ok(program.clocks),
+        Err(e) => Err(e),
+    }
+}
+
+/// Resolve a [`ClocksConfig`] into the full [`ResolvedClockProgram`] that
+/// [`super::init()`] applies: both the resulting [`Clocks`] state and the
+/// register-only values [`super::operator`] needs to get there.
+pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClockProgram, ClockError> {
     let active_power = config.vdd_power.active_mode.level;
     let lp_power = config.vdd_power.low_power_mode.level;
 
     //
     // VDD: mirrors `configure_voltages`.
     //
-    let vdd_match = match vdd_level_transition(active_power, lp_power) {
-        Ok((vdd_match, _lpwkup)) => vdd_match,
+    let (vdd_match, lpwkup) = match vdd_level_transition(active_power, lp_power) {
+        Ok(value) => value,
         Err(e) => return Err(e),
     };
     let ds_match = vdd_drive_matches(
@@ -424,6 +442,62 @@ pub(super) const fn resolve(config: &ClocksConfig) -> Result<Clocks, ClockError>
     }
     let bandgap_active = bandgap_enabled(config.vdd_power.active_mode.drive);
     let bandgap_lowpower = bandgap_enabled(config.vdd_power.low_power_mode.drive);
+
+    // Register-only values, in the same order and from the same expressions
+    // `configure_voltages` used to compute them inline.
+    let active_level_change = match active_power {
+        VddLevel::MidDriveMode => None,
+        #[cfg(feature = "mcxa5xx")]
+        VddLevel::NormalMode => Some((ActiveCfgCoreldoVddLvl::Normal, Vsm::Sram1v1)),
+        VddLevel::OverDriveMode => Some((ActiveCfgCoreldoVddLvl::Over, Vsm::Sram1v2)),
+    };
+    let (lp_drive, lp_ds) = match config.vdd_power.low_power_mode.drive {
+        VddDriveStrength::Low { enable_bandgap } => (
+            LowPowerDrive::Low {
+                enable_detectors: enable_bandgap,
+            },
+            LpCfgCoreldoVddDs::Low,
+        ),
+        VddDriveStrength::Normal => (LowPowerDrive::Normal, LpCfgCoreldoVddDs::Normal),
+    };
+    let lp_level = match lp_power {
+        VddLevel::MidDriveMode => LpCfgCoreldoVddLvl::Mid,
+        #[cfg(feature = "mcxa5xx")]
+        VddLevel::NormalMode => LpCfgCoreldoVddLvl::Normal,
+        VddLevel::OverDriveMode => LpCfgCoreldoVddLvl::Over,
+    };
+    let active_drive = match config.vdd_power.active_mode.drive {
+        VddDriveStrength::Low { enable_bandgap } => ActiveDrive::Low {
+            enable_detectors: enable_bandgap,
+            ds: ActiveCfgCoreldoVddDs::Low,
+            bgmode: if enable_bandgap {
+                ActiveCfgBgmode::Bgmode01
+            } else {
+                ActiveCfgBgmode::Bgmode0
+            },
+        },
+        VddDriveStrength::Normal => ActiveDrive::Normal,
+    };
+    let (flash_wake, flash_doze) = match config.vdd_power.flash_sleep {
+        FlashSleep::Never => (false, false),
+        FlashSleep::FlashDoze => (false, true),
+        FlashSleep::FlashDozeWithFlashWake => (true, true),
+    };
+
+    let voltage = VoltageProgram {
+        active_level_change,
+        lpwkup,
+        low_power: LowPowerProgram {
+            drive: lp_drive,
+            ds: lp_ds,
+            level: lp_level,
+            bandgap: bandgap_lowpower,
+        },
+        active: ActiveProgram { drive: active_drive },
+        core_sleep: config.vdd_power.core_sleep,
+        flash_wake,
+        flash_doze,
+    };
 
     let mut clocks = Clocks {
         active_power,
@@ -870,5 +944,5 @@ pub(super) const fn resolve(config: &ClocksConfig) -> Result<Clocks, ClockError>
         power: main_power,
     });
 
-    Ok(clocks)
+    Ok(ResolvedClockProgram { clocks, voltage })
 }
