@@ -59,6 +59,150 @@ pub use sleep::deep_sleep_if_possible;
 pub use types::{Clock, ClockError, Clocks, PoweredClock, WakeGuard};
 
 //
+// Compile-time validated clock configuration
+//
+
+/// A [`ClocksConfig`] for which [`ClocksConfig::resolve()`] has SUCCEEDED.
+///
+/// Values produced by the [`validated_clocks!`](crate::validated_clocks) macro are
+/// resolved during CONST evaluation, so an illegal configuration fails the BUILD at
+/// the point of declaration.
+///
+/// The inner field is private, so safe external code cannot construct one by struct
+/// literal, and this type deliberately implements neither [`Clone`], [`Copy`], nor
+/// [`Default`].
+///
+/// # What this does and does not guarantee
+///
+/// The macro is NOT the only safe route to a value of this type. The constructor
+/// [`__validated_clocks_config()`] is `#[doc(hidden)]` but necessarily `pub`, because
+/// the macro expands inside the user's crate; safe code can therefore call it
+/// directly, including in NON-const context, where a failed `resolve()` is a RUNTIME
+/// panic rather than a build failure. What that constructor does still guarantee is
+/// the value invariant: it re-runs `resolve()` itself, so it cannot return a token
+/// wrapping a configuration that does not resolve.
+///
+/// Handing this token to [`init_validated()`](crate::init_validated) guarantees that
+/// the same `ClocksConfig` VALUE that `resolve()` accepted is the one supplied to
+/// runtime clock initialisation. It does NOT go further than that:
+///
+/// * The const resolver ([`ClocksConfig::resolve()`], via the `calc` module) and the
+///   runtime clock operator (`operator::ClockOperator`, driven from [`init()`]) are
+///   two parallel implementations of the same clock tree. They share arithmetic
+///   helpers, which limits drift, but the control flow and state construction are
+///   duplicated. So this mechanism binds the INPUT CONFIGURATION; it does not prove
+///   that the runtime produces the [`Clocks`] tree that was asserted against, nor
+///   that the hardware realises it.
+/// * `resolve()` structurally cannot model hardware readiness - oscillator-valid
+///   bits, PLL lock, error flags, divider stability. Those are checked only at
+///   runtime, by the clock operator.
+pub struct ValidatedClocksConfig {
+    config: ClocksConfig,
+}
+
+impl ValidatedClocksConfig {
+    /// Unwrap the validated configuration, for handing to [`init()`].
+    pub(crate) fn into_inner(self) -> ClocksConfig {
+        self.config
+    }
+}
+
+/// Map a [`ClockError`] onto a const-evaluation panic.
+///
+/// NOTE: only ONE `&'static str` can be surfaced in the compiler diagnostic,
+/// because a const-evaluated `panic!` supports at most a single formatted
+/// argument. For [`ClockError::BadConfig`] the `reason` is the more specific of
+/// the two strings, so that is the one reported.
+const fn panic_on_clock_error(result: Result<u32, ClockError>) {
+    match result {
+        Ok(_) => {}
+        Err(ClockError::BadConfig { reason, .. }) => panic!("{}", reason),
+        Err(ClockError::NotImplemented { clock }) => panic!("{}", clock),
+        Err(ClockError::NeverInitialized) => panic!("system clocks were never initialized"),
+        Err(ClockError::AlreadyInitialized) => panic!("system clocks were already initialized"),
+        Err(ClockError::UnimplementedConfig) => panic!("peripheral clock config is unimplemented"),
+    }
+}
+
+/// Resolve a [`ClocksConfig`], panicking if it is not legal.
+///
+/// NOTE: the panic is a COMPILE-TIME error only when this is evaluated in const
+/// context - which is how the [`validated_clocks!`](crate::validated_clocks) macro
+/// uses it, via a `const` item. Called from a non-const context it is an ordinary
+/// RUNTIME panic.
+///
+/// NOTE: this is `pub` rather than `pub(crate)` because the
+/// [`validated_clocks!`](crate::validated_clocks) macro expands inside the
+/// *user's* crate, where a `pub(crate)` item of this crate would be
+/// unreachable. `$crate` fixes path hygiene, but NOT privacy.
+#[doc(hidden)]
+pub const fn __resolve_clocks_or_panic(config: &ClocksConfig) -> Clocks {
+    match config.resolve() {
+        Ok(clocks) => clocks,
+        Err(ClockError::BadConfig { reason, .. }) => panic!("{}", reason),
+        Err(ClockError::NotImplemented { clock }) => panic!("{}", clock),
+        Err(ClockError::NeverInitialized) => panic!("system clocks were never initialized"),
+        Err(ClockError::AlreadyInitialized) => panic!("system clocks were already initialized"),
+        Err(ClockError::UnimplementedConfig) => panic!("peripheral clock config is unimplemented"),
+    }
+}
+
+/// Wrap a [`ClocksConfig`] into a [`ValidatedClocksConfig`], panicking if it is not
+/// legal.
+///
+/// NOTE: the panic is a COMPILE-TIME error only when this is evaluated in const
+/// context - which is how the [`validated_clocks!`](crate::validated_clocks) macro
+/// uses it, via a `const` item. Called from a non-const context it is an ordinary
+/// RUNTIME panic. Either way, this cannot return a token wrapping a configuration
+/// that does not resolve.
+///
+/// NOTE: this is `pub` rather than `pub(crate)` because the
+/// [`validated_clocks!`](crate::validated_clocks) macro expands inside the
+/// *user's* crate, where a `pub(crate)` item of this crate would be
+/// unreachable. `$crate` fixes path hygiene, but NOT privacy. A consequence is
+/// that safe user code CAN call this directly, so the macro is not the only route
+/// to a [`ValidatedClocksConfig`].
+///
+/// NOTE: the call to `resolve()` here is DELIBERATELY redundant with the one in
+/// [`__resolve_clocks_or_panic()`]. It is what makes this constructor sound on
+/// its own: even somebody who bypasses the macro and calls this doc-hidden
+/// function directly still cannot wrap a configuration that does not resolve.
+/// Do not "optimise" it away.
+#[doc(hidden)]
+pub const fn __validated_clocks_config(config: ClocksConfig) -> ValidatedClocksConfig {
+    match config.resolve() {
+        Ok(_) => {}
+        Err(ClockError::BadConfig { reason, .. }) => panic!("{}", reason),
+        Err(ClockError::NotImplemented { clock }) => panic!("{}", clock),
+        Err(ClockError::NeverInitialized) => panic!("system clocks were never initialized"),
+        Err(ClockError::AlreadyInitialized) => panic!("system clocks were already initialized"),
+        Err(ClockError::UnimplementedConfig) => panic!("peripheral clock config is unimplemented"),
+    }
+    ValidatedClocksConfig { config }
+}
+
+/// Panic if a peripheral clock configuration failed validation.
+///
+/// NOTE: the panic is a COMPILE-TIME error only when this is evaluated in const
+/// context - which is how the in-crate assertions and the
+/// [`validated_clocks!`](crate::validated_clocks) macro use it, via `const _: ()`
+/// items. Called from a non-const context it is an ordinary RUNTIME panic.
+///
+/// This is the single source of truth for the `ClockError` -> compiler
+/// diagnostic mapping, shared by the in-crate assertions in
+/// [`periph_helpers`] and by the [`validated_clocks!`](crate::validated_clocks)
+/// macro.
+///
+/// NOTE: this is `pub` rather than `pub(crate)` because the
+/// [`validated_clocks!`](crate::validated_clocks) macro expands inside the
+/// *user's* crate, where a `pub(crate)` item of this crate would be
+/// unreachable. `$crate` fixes path hygiene, but NOT privacy.
+#[doc(hidden)]
+pub const fn __assert_peripheral_clock_valid(result: Result<u32, ClockError>) {
+    panic_on_clock_error(result)
+}
+
+//
 // Statics/Consts
 //
 

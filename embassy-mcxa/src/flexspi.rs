@@ -445,6 +445,16 @@ pub struct ClockConfig {
     pub div: Div4,
 }
 
+impl ClockConfig {
+    /// Validate this clock configuration against a resolved clock tree, at compile time.
+    ///
+    /// Intended for use as the `validate:` entry in
+    /// [`validated_clocks!`](crate::validated_clocks).
+    pub const fn validate_clock(&self, clocks: &crate::clocks::Clocks) -> Result<u32, crate::clocks::ClockError> {
+        crate::clocks::periph_helpers::validate_flexspi_clock(&self.power, &self.source, &self.div, clocks)
+    }
+}
+
 impl Default for ClockConfig {
     fn default() -> Self {
         Self {

@@ -81,6 +81,26 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
     peripherals
 }
 
+/// Initialize the HAL using a compile-time-validated clock configuration.
+///
+/// The `clock_cfg` field of `cfg` is IGNORED and replaced by the configuration
+/// carried inside `clocks`, so the value that was validated at compile time is
+/// the value supplied to clock initialisation.
+///
+/// That binds the INPUT CONFIGURATION only. It does not prove that the runtime
+/// clock operator produces the [`Clocks`](crate::clocks::Clocks) tree that was
+/// asserted against - the const resolver and the runtime operator are separate
+/// implementations - nor that the hardware reaches it. Hardware readiness (PLL
+/// lock, oscillator validity, error flags, divider stability) is not modelled at
+/// compile time and is checked only at runtime.
+///
+/// Obtain a [`ValidatedClocksConfig`](crate::clocks::ValidatedClocksConfig) with
+/// the [`validated_clocks!`](crate::validated_clocks) macro.
+pub fn init_validated(mut cfg: crate::config::Config, clocks: crate::clocks::ValidatedClocksConfig) -> Peripherals {
+    cfg.clock_cfg = clocks.into_inner();
+    init(cfg)
+}
+
 pub(crate) mod clock_limits {
     use crate::chips::ClockLimits;
 

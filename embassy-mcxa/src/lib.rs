@@ -13,14 +13,14 @@
 #[cfg(feature = "mcxa2xx")]
 #[path = "."]
 mod mcxa2xx_exclusive {
-    pub use crate::chips::mcxa2xx::init;
+    pub use crate::chips::mcxa2xx::{init, init_validated};
 }
 
 /// Module for MCXA5xx-specific HAL drivers
 #[cfg(feature = "mcxa5xx")]
 #[path = "."]
 mod mcxa5xx_exclusive {
-    pub use crate::chips::mcxa5xx::init;
+    pub use crate::chips::mcxa5xx::{init, init_validated};
 }
 
 pub mod rom;
@@ -162,4 +162,158 @@ macro_rules! bind_interrupts {
     (@inner $($t:tt)*) => {
         $($t)*
     }
+}
+
+/// Declare a clock configuration that is resolved and checked at compile time.
+///
+/// This macro generates a module holding the configuration, the [`Clocks`] tree
+/// it resolves to, and a [`ValidatedClocksConfig`] token. If the configuration
+/// is not legal, the build FAILS at the point of declaration, with the clock
+/// subsystem's own error message as the diagnostic.
+///
+/// Passing the generated `VALIDATED` token to
+/// [`init_validated()`](crate::init_validated) ensures that the very
+/// `ClocksConfig` value that was checked at compile time is the one supplied to
+/// runtime clock initialisation. Read the section below for the precise extent
+/// of that.
+///
+/// # What this does and does not guarantee
+///
+/// GUARANTEED: the [`ClocksConfig`] value checked by `resolve()` at compile time
+/// is the same value handed to runtime clock initialisation, when
+/// [`init_validated()`](crate::init_validated) is used.
+///
+/// GUARANTEED: an illegal clock tree, or a declared peripheral config that
+/// violates its limits, fails the BUILD at the point of declaration.
+///
+/// NOT GUARANTEED: you can still call [`init()`](crate::init) or
+/// [`clocks::init()`](crate::clocks::init) directly with an unvalidated
+/// configuration. Nothing forces you through this macro.
+///
+/// NOT GUARANTEED: declaring and asserting a peripheral const does NOT force you
+/// to pass that const to the driver. You can assert one value and pass another;
+/// nothing detects it. Using the declared const is a convention, not an
+/// enforcement.
+///
+/// NOT GUARANTEED: the const resolver and the runtime clock operator are separate
+/// implementations of the same clock tree. They share arithmetic helpers, but the
+/// control flow is duplicated, so the asserted [`Clocks`] tree is not proven equal
+/// to the [`Clocks`] the runtime installs.
+///
+/// NOT GUARANTEED: hardware readiness - PLL lock, oscillator validity, error
+/// flags, divider stability - is not modelled by `resolve()` at all. It is
+/// checked only at runtime.
+///
+/// # Macro hygiene
+///
+/// The generated module does `use super::*;`, so the declaring scope's imports
+/// resolve the same way they would at the call site. Two consequences:
+///
+/// * A glob-imported item can SHADOW a prelude macro inside the generated module.
+///   In particular, a file that does `use defmt::{.., panic, ..}` shadows the
+///   prelude `panic!`, so a `panic!` written inside a `clock_config:` or
+///   peripheral expression silently becomes `defmt::panic!` and breaks const
+///   evaluation. The symptom is a const-eval error pointing at machinery you did
+///   not write. Workaround: write `core::panic!(..)` explicitly.
+/// * The generated names `CONFIG`, `CLOCKS` and `VALIDATED` can collide with
+///   names glob-imported from the parent scope.
+///
+/// [`ClocksConfig`]: crate::clocks::config::ClocksConfig
+/// [`Clocks`]: crate::clocks::Clocks
+/// [`ValidatedClocksConfig`]: crate::clocks::ValidatedClocksConfig
+///
+/// # Example
+///
+/// ```ignore
+/// use embassy_mcxa::clocks::PoweredClock;
+/// use embassy_mcxa::clocks::config::{ClocksConfig, MainClockSource};
+/// use embassy_mcxa::clocks::periph_helpers::{Div4, FlexspiClockSel};
+/// use embassy_mcxa::flexspi::ClockConfig as FlexspiClockConfig;
+///
+/// embassy_mcxa::validated_clocks! {
+///     pub mod board_clocks {
+///         clock_config: {
+///             let mut c = ClocksConfig::new();
+///             c.main_clock.source = MainClockSource::FircHfRoot;
+///             c
+///         };
+///         peripherals: {
+///             /// Clock settings for the on-board QSPI flash.
+///             pub const FLASH_CLK: FlexspiClockConfig = FlexspiClockConfig {
+///                 power: PoweredClock::NormalEnabledDeepSleepDisabled,
+///                 source: FlexspiClockSel::FroHf,
+///                 div: Div4::no_div(),
+///             };
+///             validate: FlexspiClockConfig::validate_clock;
+///         }
+///     }
+/// }
+///
+/// let p = embassy_mcxa::init_validated(Default::default(), board_clocks::VALIDATED);
+/// ```
+///
+/// Each `peripherals` entry names a `const` of a driver's public clock-config
+/// type, plus a `validate:` path to a `const fn(&T, &Clocks) -> Result<u32,
+/// ClockError>`. The assertion is emitted as a `const _: () = { .. }` item, so
+/// it is checked whether or not the constant is ever used.
+///
+/// The `peripherals` block may be omitted entirely.
+#[macro_export]
+macro_rules! validated_clocks {
+    (
+        $(#[$attr:meta])*
+        $vis:vis mod $name:ident {
+            clock_config: $clock_config:expr;
+            peripherals: {
+                $(
+                    $(#[$pattr:meta])*
+                    $pvis:vis const $pname:ident : $pty:ty = $pcfg:expr;
+                    validate: $validator:path;
+                )*
+            }
+        }
+    ) => {
+        $(#[$attr])*
+        $vis mod $name {
+            // Bring the declaring scope's imports (clock config types, driver
+            // config types, ..) into this generated module, so that the
+            // user-written expressions below resolve the same way they would
+            // have at the macro call site.
+            #[allow(unused_imports)]
+            use super::*;
+
+            /// The clock configuration declared at this site.
+            pub const CONFIG: $crate::clocks::config::ClocksConfig = $clock_config;
+
+            /// `CONFIG` resolved at compile time. The build fails here if it is not legal.
+            pub const CLOCKS: $crate::clocks::Clocks = $crate::clocks::__resolve_clocks_or_panic(&CONFIG);
+
+            /// Proof that `CONFIG` resolves; pass to `init_validated()`.
+            pub const VALIDATED: $crate::clocks::ValidatedClocksConfig =
+                $crate::clocks::__validated_clocks_config(CONFIG);
+
+            $(
+                $(#[$pattr])*
+                $pvis const $pname: $pty = $pcfg;
+
+                const _: () = {
+                    $crate::clocks::__assert_peripheral_clock_valid($validator(&$pname, &CLOCKS));
+                };
+            )*
+        }
+    };
+    (
+        $(#[$attr:meta])*
+        $vis:vis mod $name:ident {
+            clock_config: $clock_config:expr;
+        }
+    ) => {
+        $crate::validated_clocks! {
+            $(#[$attr])*
+            $vis mod $name {
+                clock_config: $clock_config;
+                peripherals: {}
+            }
+        }
+    };
 }

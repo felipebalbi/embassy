@@ -956,43 +956,72 @@ pub struct FlexspiConfig {
     pub(crate) instance: FlexspiInstance,
 }
 
+/// Validate a `FlexSPI` clock configuration against a resolved clock tree.
+///
+/// This is the instance-independent body of [`FlexspiConfig::validate()`],
+/// extracted so that the public, user-facing mirror type
+/// [`crate::flexspi::ClockConfig`] - which carries no instance - can run the
+/// exact same check at compile time.
+///
+/// # Reachability of the `"exceeds max rating"` branch
+///
+/// Empirical finding: the `fmax` values below coincide EXACTLY with the maximum
+/// legal clock-tree frequencies in mid-drive (96 MHz) and normal-drive (240 MHz).
+/// Because the comparison is a strict `>`, the `"exceeds max rating"` error is
+/// therefore UNREACHABLE in those two modes. It can only fire in over-drive, where
+/// `pll1_clk` (400 MHz) rather than `2 * cpu_clk` becomes binding and exceeds the
+/// 320 MHz FlexSPI limit.
+///
+/// That branch is thus close to dead code in the modes users normally run. A single
+/// off-by-one (`>` vs `>=`) or an edit to the limit tables could make it permanently
+/// dead without any build failure.
+#[cfg(feature = "mcxa5xx")]
+pub(crate) const fn validate_flexspi_clock(
+    power: &PoweredClock,
+    source: &FlexspiClockSel,
+    div: &Div4,
+    clocks: &Clocks,
+) -> Result<u32, ClockError> {
+    let freq = match source {
+        FlexspiClockSel::FroHf => match clocks.ensure_fro_hf_active(power) {
+            Ok(freq) => freq,
+            Err(e) => return Err(e),
+        },
+        FlexspiClockSel::Pll1Clk => match clocks.ensure_pll1_clk_active(power) {
+            Ok(freq) => freq,
+            Err(e) => return Err(e),
+        },
+    };
+
+    let div = div.into_divisor();
+    // Peripheral clock max functional clock limits: MCXA5xx 28.3.2
+    let power = match power {
+        PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
+        PoweredClock::AlwaysEnabled => clocks.lp_power,
+    };
+
+    let fmax: u32 = match power {
+        VddLevel::MidDriveMode => 96_000_000,
+        VddLevel::NormalMode => 240_000_000,
+        VddLevel::OverDriveMode => 320_000_000,
+    };
+
+    // Compare exactly without overflowing: the post-divider frequency
+    // exceeds fmax exactly when `freq > fmax * div`.
+    if (freq as u64) > (fmax as u64) * (div as u64) {
+        return Err(ClockError::BadConfig {
+            clock: "flexspi fclk",
+            reason: "exceeds max rating",
+        });
+    }
+
+    Ok(freq)
+}
+
 #[cfg(feature = "mcxa5xx")]
 impl FlexspiConfig {
     const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
-        let freq = match self.source {
-            FlexspiClockSel::FroHf => match clocks.ensure_fro_hf_active(&self.power) {
-                Ok(freq) => freq,
-                Err(e) => return Err(e),
-            },
-            FlexspiClockSel::Pll1Clk => match clocks.ensure_pll1_clk_active(&self.power) {
-                Ok(freq) => freq,
-                Err(e) => return Err(e),
-            },
-        };
-
-        let div = self.div.into_divisor();
-        // Peripheral clock max functional clock limits: MCXA5xx 28.3.2
-        let power = match self.power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
-            PoweredClock::AlwaysEnabled => clocks.lp_power,
-        };
-
-        let fmax: u32 = match power {
-            VddLevel::MidDriveMode => 96_000_000,
-            VddLevel::NormalMode => 240_000_000,
-            VddLevel::OverDriveMode => 320_000_000,
-        };
-
-        // Compare exactly without overflowing: the post-divider frequency
-        // exceeds fmax exactly when `freq > fmax * div`.
-        if (freq as u64) > (fmax as u64) * (div as u64) {
-            return Err(ClockError::BadConfig {
-                clock: "flexspi fclk",
-                reason: "exceeds max rating",
-            });
-        }
-
-        Ok(freq)
+        validate_flexspi_clock(&self.power, &self.source, &self.div, clocks)
     }
 }
 
@@ -1988,15 +2017,12 @@ impl SPConfHelper for CanConfig {
 /// because a const-evaluated `panic!` supports at most a single formatted
 /// argument. For [`ClockError::BadConfig`] the `reason` is the more specific
 /// of the two strings, so that is the one reported.
+///
+/// The actual error -> diagnostic mapping lives in
+/// [`crate::clocks::__assert_peripheral_clock_valid()`], so that it is shared
+/// with the `validated_clocks!` macro and there is exactly one copy of it.
 const fn assert_valid(result: Result<u32, ClockError>) {
-    match result {
-        Ok(_) => {}
-        Err(ClockError::BadConfig { reason, .. }) => panic!("{}", reason),
-        Err(ClockError::NotImplemented { clock }) => panic!("{}", clock),
-        Err(ClockError::NeverInitialized) => panic!("system clocks were never initialized"),
-        Err(ClockError::AlreadyInitialized) => panic!("system clocks were already initialized"),
-        Err(ClockError::UnimplementedConfig) => panic!("peripheral clock config is unimplemented"),
-    }
+    crate::clocks::__assert_peripheral_clock_valid(result)
 }
 
 /// Const-friendly [`Div4`] constructor, for use in the assertions below.
