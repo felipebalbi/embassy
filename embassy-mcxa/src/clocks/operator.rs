@@ -313,22 +313,22 @@ impl ClockOperator<'_> {
     /// Configure the ROSC/OSC32K clock family
     #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
     pub(super) fn configure_osc32k_clocks(&mut self) -> Result<(), ClockError> {
-        use config::{Osc32KCapSel, Osc32KCoarseGain, Osc32KMode};
-        use nxp_pac::vbat::{
-            CoarseAmpGain, ExtalCapSel, InitTrim, ModeEn, StatusaLdoRdy, StatusaOscRdy, SupplyDet, XtalCapSel,
-        };
+        use nxp_pac::vbat::{ExtalCapSel, InitTrim, ModeEn, StatusaLdoRdy, StatusaOscRdy, XtalCapSel};
+
+        use super::program::Osc32KProgram;
 
         // Unlock the control first
         self.vbat0.ldolcka().modify(|w| w.set_lock(false));
 
-        let Some(cfg) = self.config.osc32k.as_ref() else {
+        let program = &self.resolved.osc32k;
+        if let Osc32KProgram::Absent = program {
             // TODO: how to ensure disabled?
             // ???
 
             // Re-lock after disabling
             self.vbat0.ldolcka().modify(|w| w.set_lock(true));
             return Ok(());
-        };
+        }
 
         // To enable and lock the LDO and bandgap:
         //
@@ -338,8 +338,9 @@ impl ClockOperator<'_> {
         //   * NOTE(AJM): clk_16k is always enabled if enabled at all.
         //   * TODO(AJM): I'm not sure which domain needs to be active for this requirement.
         //     It seems reasonable that it would be the vbat domain?
-
-        self.clocks.ensure_clk_16k_vbat_active(&PoweredClock::AlwaysEnabled)?;
+        //
+        // NOTE: the `clk_16k_vbat` prerequisite is enforced during resolution, before
+        // we get here.
 
         // 2. Write 7h to LDO_RAM Control A (LDOCTLA).
         self.vbat0.ldoctla().write(|w| {
@@ -354,11 +355,14 @@ impl ClockOperator<'_> {
         // 4. Write 1h to LDOLCKA[LOCK].
         self.vbat0.ldolcka().modify(|w| w.set_lock(true));
 
-        match &cfg.mode {
-            Osc32KMode::HighPower {
-                coarse_amp_gain,
+        match *program {
+            // Handled by the early return above; no registers are touched here.
+            Osc32KProgram::Absent => {}
+            Osc32KProgram::HighPower {
                 xtal_cap_sel,
                 extal_cap_sel,
+                coarse_amp_gain,
+                clke,
             } => {
                 // To configure and lock OSC32kHz for normal mode operation:
                 //
@@ -367,46 +371,9 @@ impl ClockOperator<'_> {
                 // XTAL32K pins. Configure 0h to OSCCTLA[MODE_EN], 1h to OSCCTLA[CAP_SEL_EN], and 1h to OSCCTLA[OSC_EN].
                 //   * NOTE(AJM): You must write 1 to this field and OSCCTLA[OSC_EN] simultaneously.
                 self.vbat0.oscctla().modify(|w| {
-                    w.set_xtal_cap_sel(match xtal_cap_sel {
-                        Osc32KCapSel::Cap2PicoF => XtalCapSel::Sel2,
-                        Osc32KCapSel::Cap4PicoF => XtalCapSel::Sel4,
-                        Osc32KCapSel::Cap6PicoF => XtalCapSel::Sel6,
-                        Osc32KCapSel::Cap8PicoF => XtalCapSel::Sel8,
-                        Osc32KCapSel::Cap10PicoF => XtalCapSel::Sel10,
-                        Osc32KCapSel::Cap12PicoF => XtalCapSel::Sel12,
-                        Osc32KCapSel::Cap14PicoF => XtalCapSel::Sel14,
-                        Osc32KCapSel::Cap16PicoF => XtalCapSel::Sel16,
-                        Osc32KCapSel::Cap18PicoF => XtalCapSel::Sel18,
-                        Osc32KCapSel::Cap20PicoF => XtalCapSel::Sel20,
-                        Osc32KCapSel::Cap22PicoF => XtalCapSel::Sel22,
-                        Osc32KCapSel::Cap24PicoF => XtalCapSel::Sel24,
-                        Osc32KCapSel::Cap26PicoF => XtalCapSel::Sel26,
-                        Osc32KCapSel::Cap28PicoF => XtalCapSel::Sel28,
-                        Osc32KCapSel::Cap30PicoF => XtalCapSel::Sel30,
-                    });
-                    w.set_extal_cap_sel(match extal_cap_sel {
-                        Osc32KCapSel::Cap2PicoF => ExtalCapSel::Sel2,
-                        Osc32KCapSel::Cap4PicoF => ExtalCapSel::Sel4,
-                        Osc32KCapSel::Cap6PicoF => ExtalCapSel::Sel6,
-                        Osc32KCapSel::Cap8PicoF => ExtalCapSel::Sel8,
-                        Osc32KCapSel::Cap10PicoF => ExtalCapSel::Sel10,
-                        Osc32KCapSel::Cap12PicoF => ExtalCapSel::Sel12,
-                        Osc32KCapSel::Cap14PicoF => ExtalCapSel::Sel14,
-                        Osc32KCapSel::Cap16PicoF => ExtalCapSel::Sel16,
-                        Osc32KCapSel::Cap18PicoF => ExtalCapSel::Sel18,
-                        Osc32KCapSel::Cap20PicoF => ExtalCapSel::Sel20,
-                        Osc32KCapSel::Cap22PicoF => ExtalCapSel::Sel22,
-                        Osc32KCapSel::Cap24PicoF => ExtalCapSel::Sel24,
-                        Osc32KCapSel::Cap26PicoF => ExtalCapSel::Sel26,
-                        Osc32KCapSel::Cap28PicoF => ExtalCapSel::Sel28,
-                        Osc32KCapSel::Cap30PicoF => ExtalCapSel::Sel30,
-                    });
-                    w.set_coarse_amp_gain(match coarse_amp_gain {
-                        Osc32KCoarseGain::EsrRange0 => CoarseAmpGain::Gain05,
-                        Osc32KCoarseGain::EsrRange1 => CoarseAmpGain::Gain10,
-                        Osc32KCoarseGain::EsrRange2 => CoarseAmpGain::Gain18,
-                        Osc32KCoarseGain::EsrRange3 => CoarseAmpGain::Gain33,
-                    });
+                    w.set_xtal_cap_sel(xtal_cap_sel);
+                    w.set_extal_cap_sel(extal_cap_sel);
+                    w.set_coarse_amp_gain(coarse_amp_gain);
                     w.set_mode_en(ModeEn::Hp);
                     w.set_cap_sel_en(true);
                     w.set_osc_en(true);
@@ -425,30 +392,17 @@ impl ClockOperator<'_> {
                 });
 
                 // 5. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
-                const ENABLED: Option<Clock> = Some(Clock {
-                    frequency: calc::OSC_32K_FREQUENCY,
-                    power: PoweredClock::NormalEnabledDeepSleepDisabled,
-                });
+                self.clocks.clk_32k_vsys = self.resolved.clocks.clk_32k_vsys.clone();
+                self.clocks.clk_32k_vdd_core = self.resolved.clocks.clk_32k_vdd_core.clone();
+                self.clocks.clk_32k_vbat = self.resolved.clocks.clk_32k_vbat.clone();
                 self.vbat0.oscclke().modify(|w| {
-                    let mut val = 0u8;
-                    if cfg.vsys_domain_active {
-                        val |= 0b001;
-                        self.clocks.clk_32k_vsys = ENABLED;
-                    }
-                    if cfg.vdd_core_domain_active {
-                        val |= 0b010;
-                        self.clocks.clk_32k_vdd_core = ENABLED;
-                    }
-                    if cfg.vbat_domain_active {
-                        val |= 0b100;
-                        self.clocks.clk_32k_vbat = ENABLED;
-                    }
-                    w.set_clke(val);
+                    w.set_clke(clke);
                 });
             }
-            Osc32KMode::LowPower {
+            Osc32KProgram::LowPower {
                 coarse_amp_gain,
-                vbat_exceeds_3v0,
+                supply_det,
+                clke,
             } => {
                 // To configure OSC32kHz for low power mode operation:
                 //
@@ -467,12 +421,7 @@ impl ClockOperator<'_> {
                     w.set_xtal_cap_sel(XtalCapSel::Sel0);
                     w.set_extal_cap_sel(ExtalCapSel::Sel0);
 
-                    w.set_coarse_amp_gain(match coarse_amp_gain {
-                        Osc32KCoarseGain::EsrRange0 => CoarseAmpGain::Gain05,
-                        Osc32KCoarseGain::EsrRange1 => CoarseAmpGain::Gain10,
-                        Osc32KCoarseGain::EsrRange2 => CoarseAmpGain::Gain18,
-                        Osc32KCoarseGain::EsrRange3 => CoarseAmpGain::Gain33,
-                    });
+                    w.set_coarse_amp_gain(coarse_amp_gain);
 
                     // TODO: This naming is bad
                     //
@@ -503,36 +452,18 @@ impl ClockOperator<'_> {
                     w.set_mode_en(ModeEn::Sw);
                     w.set_xtal_cap_sel(XtalCapSel::Sel0);
                     w.set_extal_cap_sel(ExtalCapSel::Sel0);
-                    w.set_supply_det(if *vbat_exceeds_3v0 {
-                        SupplyDet::G3vsupply
-                    } else {
-                        SupplyDet::L3vsupply
-                    });
+                    w.set_supply_det(supply_det);
                 });
 
                 // 6. Wait for STATUSA[OSC_RDY] to become 1.
                 while self.vbat0.statusa().read().osc_rdy() != StatusaOscRdy::Set {}
 
                 // 7. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
-                const ENABLED: Option<Clock> = Some(Clock {
-                    frequency: calc::OSC_32K_FREQUENCY,
-                    power: PoweredClock::AlwaysEnabled,
-                });
+                self.clocks.clk_32k_vsys = self.resolved.clocks.clk_32k_vsys.clone();
+                self.clocks.clk_32k_vdd_core = self.resolved.clocks.clk_32k_vdd_core.clone();
+                self.clocks.clk_32k_vbat = self.resolved.clocks.clk_32k_vbat.clone();
                 self.vbat0.oscclke().modify(|w| {
-                    let mut val = 0u8;
-                    if cfg.vsys_domain_active {
-                        val |= 0b001;
-                        self.clocks.clk_32k_vsys = ENABLED;
-                    }
-                    if cfg.vdd_core_domain_active {
-                        val |= 0b010;
-                        self.clocks.clk_32k_vdd_core = ENABLED;
-                    }
-                    if cfg.vbat_domain_active {
-                        val |= 0b100;
-                        self.clocks.clk_32k_vbat = ENABLED;
-                    }
-                    w.set_clke(val);
+                    w.set_clke(clke);
                 });
             }
         }

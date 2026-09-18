@@ -8,6 +8,8 @@
 use super::config::{
     ClocksConfig, Div8, FircFreqSel, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
 };
+#[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+use super::program::Osc32KProgram;
 use super::program::{
     ActiveDrive, ActiveProgram, FircProgram, Fro16KProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram,
     SircProgram, VoltageProgram,
@@ -18,6 +20,8 @@ use crate::pac::scg::Fircsten;
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
+#[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+use crate::pac::vbat::{CoarseAmpGain, ExtalCapSel, SupplyDet, XtalCapSel};
 
 //
 // Frequency constants
@@ -714,14 +718,96 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     // depends on `clk_16k_vbat` being active.
     //
     #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+    let mut osc32k_program = Osc32KProgram::Absent;
+    #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
     if let Some(cfg) = config.osc32k.as_ref() {
-        use super::config::Osc32KMode;
+        use super::config::{Osc32KCapSel, Osc32KCoarseGain, Osc32KMode};
 
         // NOTE(AJM): "The FRO16K must be enabled before enabling the SRAM LDO or the bandgap"
         match clocks.ensure_clk_16k_vbat_active(&PoweredClock::AlwaysEnabled) {
             Ok(_) => {}
             Err(e) => return Err(e),
         }
+
+        // Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different
+        // peripherals to reduce power consumption.
+        let mut clke = 0u8;
+        if cfg.vsys_domain_active {
+            clke |= 0b001;
+        }
+        if cfg.vdd_core_domain_active {
+            clke |= 0b010;
+        }
+        if cfg.vbat_domain_active {
+            clke |= 0b100;
+        }
+
+        osc32k_program = match &cfg.mode {
+            Osc32KMode::HighPower {
+                coarse_amp_gain,
+                xtal_cap_sel,
+                extal_cap_sel,
+            } => Osc32KProgram::HighPower {
+                xtal_cap_sel: match xtal_cap_sel {
+                    Osc32KCapSel::Cap2PicoF => XtalCapSel::Sel2,
+                    Osc32KCapSel::Cap4PicoF => XtalCapSel::Sel4,
+                    Osc32KCapSel::Cap6PicoF => XtalCapSel::Sel6,
+                    Osc32KCapSel::Cap8PicoF => XtalCapSel::Sel8,
+                    Osc32KCapSel::Cap10PicoF => XtalCapSel::Sel10,
+                    Osc32KCapSel::Cap12PicoF => XtalCapSel::Sel12,
+                    Osc32KCapSel::Cap14PicoF => XtalCapSel::Sel14,
+                    Osc32KCapSel::Cap16PicoF => XtalCapSel::Sel16,
+                    Osc32KCapSel::Cap18PicoF => XtalCapSel::Sel18,
+                    Osc32KCapSel::Cap20PicoF => XtalCapSel::Sel20,
+                    Osc32KCapSel::Cap22PicoF => XtalCapSel::Sel22,
+                    Osc32KCapSel::Cap24PicoF => XtalCapSel::Sel24,
+                    Osc32KCapSel::Cap26PicoF => XtalCapSel::Sel26,
+                    Osc32KCapSel::Cap28PicoF => XtalCapSel::Sel28,
+                    Osc32KCapSel::Cap30PicoF => XtalCapSel::Sel30,
+                },
+                extal_cap_sel: match extal_cap_sel {
+                    Osc32KCapSel::Cap2PicoF => ExtalCapSel::Sel2,
+                    Osc32KCapSel::Cap4PicoF => ExtalCapSel::Sel4,
+                    Osc32KCapSel::Cap6PicoF => ExtalCapSel::Sel6,
+                    Osc32KCapSel::Cap8PicoF => ExtalCapSel::Sel8,
+                    Osc32KCapSel::Cap10PicoF => ExtalCapSel::Sel10,
+                    Osc32KCapSel::Cap12PicoF => ExtalCapSel::Sel12,
+                    Osc32KCapSel::Cap14PicoF => ExtalCapSel::Sel14,
+                    Osc32KCapSel::Cap16PicoF => ExtalCapSel::Sel16,
+                    Osc32KCapSel::Cap18PicoF => ExtalCapSel::Sel18,
+                    Osc32KCapSel::Cap20PicoF => ExtalCapSel::Sel20,
+                    Osc32KCapSel::Cap22PicoF => ExtalCapSel::Sel22,
+                    Osc32KCapSel::Cap24PicoF => ExtalCapSel::Sel24,
+                    Osc32KCapSel::Cap26PicoF => ExtalCapSel::Sel26,
+                    Osc32KCapSel::Cap28PicoF => ExtalCapSel::Sel28,
+                    Osc32KCapSel::Cap30PicoF => ExtalCapSel::Sel30,
+                },
+                coarse_amp_gain: match coarse_amp_gain {
+                    Osc32KCoarseGain::EsrRange0 => CoarseAmpGain::Gain05,
+                    Osc32KCoarseGain::EsrRange1 => CoarseAmpGain::Gain10,
+                    Osc32KCoarseGain::EsrRange2 => CoarseAmpGain::Gain18,
+                    Osc32KCoarseGain::EsrRange3 => CoarseAmpGain::Gain33,
+                },
+                clke,
+            },
+            Osc32KMode::LowPower {
+                coarse_amp_gain,
+                vbat_exceeds_3v0,
+            } => Osc32KProgram::LowPower {
+                coarse_amp_gain: match coarse_amp_gain {
+                    Osc32KCoarseGain::EsrRange0 => CoarseAmpGain::Gain05,
+                    Osc32KCoarseGain::EsrRange1 => CoarseAmpGain::Gain10,
+                    Osc32KCoarseGain::EsrRange2 => CoarseAmpGain::Gain18,
+                    Osc32KCoarseGain::EsrRange3 => CoarseAmpGain::Gain33,
+                },
+                supply_det: if *vbat_exceeds_3v0 {
+                    SupplyDet::G3vsupply
+                } else {
+                    SupplyDet::L3vsupply
+                },
+                clke,
+            },
+        };
 
         let power = match cfg.mode {
             Osc32KMode::HighPower { .. } => PoweredClock::NormalEnabledDeepSleepDisabled,
@@ -1013,5 +1099,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         sirc,
         firc: firc_program,
         fro16k: fro16k_program,
+        #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+        osc32k: osc32k_program,
     })
 }

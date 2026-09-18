@@ -16,6 +16,8 @@ use crate::pac::scg::{Fircsten, FreqSel};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
+#[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+use crate::pac::vbat::{CoarseAmpGain, ExtalCapSel, SupplyDet, XtalCapSel};
 
 /// A fully resolved clock configuration, ready to be applied to hardware.
 pub(super) struct ResolvedClockProgram {
@@ -29,6 +31,40 @@ pub(super) struct ResolvedClockProgram {
     pub(super) firc: FircProgram,
     /// The values `configure_fro16k_clocks` needs.
     pub(super) fro16k: Fro16KProgram,
+    /// The values `configure_osc32k_clocks` needs.
+    #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+    pub(super) osc32k: Osc32KProgram,
+}
+
+/// Everything `configure_osc32k_clocks` derives from the configuration.
+///
+/// Each mode's hardware parameters live inside its own variant, so that no
+/// high-power-only value is carried into (and left unread by) the low-power
+/// path, or vice versa.
+#[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+pub(super) enum Osc32KProgram {
+    /// No OSC32K configuration was requested.
+    Absent,
+    /// High performance transconductance oscillator mode.
+    HighPower {
+        /// `VBAT0[OSCCTLA.XTAL_CAP_SEL]`.
+        xtal_cap_sel: XtalCapSel,
+        /// `VBAT0[OSCCTLA.EXTAL_CAP_SEL]`.
+        extal_cap_sel: ExtalCapSel,
+        /// `VBAT0[OSCCTLA.COARSE_AMP_GAIN]`.
+        coarse_amp_gain: CoarseAmpGain,
+        /// `VBAT0[OSCCLKE.CLKE]`, the output-gate bitmask.
+        clke: u8,
+    },
+    /// Low power switched oscillator mode.
+    LowPower {
+        /// `VBAT0[OSCCTLA.COARSE_AMP_GAIN]`.
+        coarse_amp_gain: CoarseAmpGain,
+        /// `VBAT0[OSCCTLA.SUPPLY_DET]`.
+        supply_det: SupplyDet,
+        /// `VBAT0[OSCCLKE.CLKE]`, the output-gate bitmask.
+        clke: u8,
+    },
 }
 
 /// Everything `configure_fro16k_clocks` derives from the configuration.
