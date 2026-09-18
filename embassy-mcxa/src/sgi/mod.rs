@@ -19,6 +19,8 @@ use crate::sgi::hash::{BlockingHasher, DmaHasher, StreamingHasher};
 pub mod hash;
 
 trait SealedInstance: crate::clocks::Gate<MrccPeriphConfig = Clk1MConfig> {
+    const CLOCK_CONFIG: Clk1MConfig;
+
     fn info() -> &'static Info;
 }
 
@@ -56,6 +58,8 @@ impl Info {
 unsafe impl Sync for Info {}
 
 impl SealedInstance for peripherals::SGI0 {
+    const CLOCK_CONFIG: Clk1MConfig = Clk1MConfig::new();
+
     fn info() -> &'static Info {
         static INFO: Info = Info {
             regs: crate::pac::SGI0,
@@ -175,7 +179,7 @@ fn is_expired(start: Instant, timeout: u64) -> bool {
 
 impl<'d, M: Mode> Sgi<'d, M> {
     fn new_inner<T: Instance>(_peri: Peri<'d, T>) -> Result<Self, SetupError> {
-        let parts = unsafe { enable_and_reset::<T>(&Clk1MConfig).map_err(SetupError::ClockSetup)? };
+        let parts = unsafe { enable_and_reset::<T>(&T::CLOCK_CONFIG).map_err(SetupError::ClockSetup)? };
         Ok(Self {
             info: T::info(),
             _phantom: PhantomData,

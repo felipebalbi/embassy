@@ -15,6 +15,8 @@ use super::{ClockError, Clocks, PoweredClock, WakeGuard};
 use crate::clocks::VddLevel;
 #[cfg(feature = "mcxa5xx")]
 use crate::pac::mrcc::FlexspiClkselMux;
+#[cfg(feature = "mcxa5xx")]
+use crate::pac::mrcc::WwdtClkselMux;
 use crate::pac::mrcc::{
     AdcClkselMux, ClkdivHalt, ClkdivReset, ClkdivUnstab, CtimerClkselMux, DacClkselMux, FclkClkselMux,
     FlexcanClkselMux, Lpi2cClkselMux, LpspiClkselMux, LpuartClkselMux, OstimerClkselMux,
@@ -240,16 +242,95 @@ impl SPConfHelper for NoConfig {
     }
 }
 
-/// A basic type that always returns `Ok` when `PreEnableParts` is called.
+/// Which clock configuration is represented by [`Clk1MConfig`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Clk1MConfigKind {
+    /// A peripheral already hardwired to `clk_1m`.
+    FixedClk1M,
+    /// MCXA5xx WWDT1, whose mux and divider must be programmed.
+    #[cfg(feature = "mcxa5xx")]
+    Wwdt1,
+}
+
+/// Clock configuration for peripherals using `clk_1m`.
 ///
-/// This should only be used for peripherals that are clocked only by
-/// the CLK1M clock and have no other selectable/configurable source
-/// clock.
-pub struct Clk1MConfig;
+/// WWDT0 and SGI0 are already hardwired to `clk_1m`. On MCXA5xx,
+/// WWDT1 additionally requires its source mux and divider to be programmed.
+pub struct Clk1MConfig {
+    pub(crate) kind: Clk1MConfigKind,
+}
 
 impl Clk1MConfig {
-    const fn validate(&self, _clocks: &Clocks) -> Result<u32, ClockError> {
-        Ok(1_000_000)
+    /// Construct the configuration for a peripheral already hardwired to
+    /// `clk_1m`.
+    pub const fn new() -> Self {
+        Self {
+            kind: Clk1MConfigKind::FixedClk1M,
+        }
+    }
+
+    /// Construct the configuration belonging to a WWDT instance.
+    pub(crate) const fn for_wwdt(instance: u8) -> Self {
+        match instance {
+            0 => Self::new(),
+            #[cfg(feature = "mcxa5xx")]
+            1 => Self {
+                kind: Clk1MConfigKind::Wwdt1,
+            },
+            _ => panic!("unsupported WWDT instance"),
+        }
+    }
+
+    const fn validate(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        // The power requirement is per-branch.
+        //
+        // WWDT0 and SGI0 keep the least restrictive requirement, which accepts
+        // clk_1m whether or not it survives deep sleep. This preserves their
+        // existing behavior exactly.
+        //
+        // WWDT1 instead requires AlwaysEnabled. Out of reset its mux selects
+        // CLK_16K, which keeps running through deep sleep unconditionally; this
+        // HAL programs the mux to CLK_1M, which only survives deep sleep when
+        // SIRC is configured always-on (SIRCSTEN = 1, MCXA5xx RM Rev 1 §29).
+        // Demanding it here turns a silently suspended watchdog - one that stops
+        // counting in deep sleep and so never fires - into a loud
+        // configuration-time error. §34.3.4.1 likewise requires the oscillator
+        // to be enabled for each power mode before MOD[LOCK] is set.
+        //
+        // apply() intentionally preserves the historical wake_guard: None
+        // behavior on every branch: for a watchdog, failing at configuration
+        // time is correct, silently forcing the system to stay awake is not.
+        let power = match self.kind {
+            Clk1MConfigKind::FixedClk1M => PoweredClock::NormalEnabledDeepSleepDisabled,
+            #[cfg(feature = "mcxa5xx")]
+            Clk1MConfigKind::Wwdt1 => PoweredClock::AlwaysEnabled,
+        };
+        let freq = match clocks.ensure_clk_1m_active(&power) {
+            Ok(freq) => freq,
+            Err(e) => return Err(e),
+        };
+
+        match self.kind {
+            Clk1MConfigKind::FixedClk1M => Ok(freq),
+            #[cfg(feature = "mcxa5xx")]
+            Clk1MConfigKind::Wwdt1 => {
+                let div = Div4::no_div().into_divisor();
+                let fmax: u32 = 1_000_000;
+
+                // MCXA5xx RM Rev 1 §28.3.2: WWDT0/1 clock is limited
+                // to 1 MHz in every run mode.
+                // Compare exactly without overflowing: the post-divider frequency
+                // exceeds fmax exactly when `freq > fmax * div`.
+                if (freq as u64) > (fmax as u64) * (div as u64) {
+                    return Err(ClockError::BadConfig {
+                        clock: "wwdt1_clk",
+                        reason: "wwdt1_clk exceeds maximum rating",
+                    });
+                }
+
+                Ok(freq)
+            }
+        }
     }
 }
 
@@ -259,7 +340,36 @@ impl SPConfHelper for Clk1MConfig {
     }
 
     fn apply(&self, freq: u32) -> PreEnableParts {
-        PreEnableParts { freq, wake_guard: None }
+        match self.kind {
+            Clk1MConfigKind::FixedClk1M => PreEnableParts { freq, wake_guard: None },
+            #[cfg(feature = "mcxa5xx")]
+            Clk1MConfigKind::Wwdt1 => {
+                let mrcc0 = crate::pac::MRCC0;
+                let clksel = mrcc0.mrcc_wwdt1_clksel();
+                let clkdiv = mrcc0.mrcc_wwdt1_clkdiv();
+                let div = Div4::no_div();
+
+                // MCXA5xx RM Rev 1 §22.5.2.36: MUX=10b selects CLK_1M.
+                clksel.modify(|w| w.set_mux(WwdtClkselMux::I2Clkroot1m));
+
+                clkdiv.modify(|w| {
+                    w.set_div(div.into_bits());
+                    w.set_halt(ClkdivHalt::Off);
+                    w.set_reset(ClkdivReset::Off);
+                });
+                clkdiv.modify(|w| {
+                    w.set_halt(ClkdivHalt::On);
+                    w.set_reset(ClkdivReset::On);
+                });
+
+                while clkdiv.read().unstab() == ClkdivUnstab::Off {}
+
+                PreEnableParts {
+                    freq: freq / div.into_divisor(),
+                    wake_guard: None,
+                }
+            }
+        }
     }
 }
 
@@ -2236,7 +2346,7 @@ const _: () = {
 
     // Placeholder helpers.
     assert_valid(NoConfig.validate(clocks));
-    assert_valid(Clk1MConfig.validate(clocks));
+    assert_valid(Clk1MConfig::new().validate(clocks));
     // NOTE: `UnimplementedConfig` is deliberately NOT asserted here - failing
     // validation is its entire contract.
 

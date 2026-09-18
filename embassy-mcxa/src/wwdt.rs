@@ -4,7 +4,9 @@
 //! periodically "feed" the watchdog within a specified time window. This helps detect
 //! and recover from software failures or system hangs.
 //!
-//! The FRO12M provides a 1 MHz clock (clk_1m) used as WWDT0 independant clock source. This clock is / 4 by an internal fixed divider.
+//! The FRO12M provides a 1 MHz clock (clk_1m) used as the independent clock source for each WWDT instance. WWDT0 is
+//! hardwired to clk_1m; on MCXA5xx, WWDT1 is fed through a mux that this HAL programs to CLK_1M. This clock is / 4 by
+//! an internal fixed divider.
 
 #[cfg(feature = "embedded-mcu-hal")]
 use core::convert::Infallible;
@@ -20,7 +22,7 @@ use crate::interrupt::typelevel::{Handler, Interrupt};
 use crate::pac;
 use crate::pac::wwdt::{Wden, Wdprotect, Wdreset};
 
-/// WWDT0 Error types
+/// WWDT Error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
@@ -63,14 +65,14 @@ impl<'d> Watchdog<'d> {
     /// # Arguments
     ///
     /// * `_peri` - The WWDT peripheral instance
-    /// * `_irq` - Interrupt binding for WWDT0
+    /// * `_irq` - Interrupt binding for the WWDT instance
     /// * `config - WWDT config with timeout and optional warning value
     pub fn new<T: Instance>(
         _peri: Peri<'d, T>,
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, Error> {
-        let parts = unsafe { enable_and_reset::<T>(&Clk1MConfig).map_err(Error::ClockSetup)? };
+        let parts = unsafe { enable_and_reset::<T>(&T::CLOCK_CONFIG).map_err(Error::ClockSetup)? };
 
         let watchdog = Self {
             info: T::info(),
@@ -216,6 +218,8 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
 }
 
 pub(crate) trait SealedInstance: Gate<MrccPeriphConfig = Clk1MConfig> {
+    const CLOCK_CONFIG: Clk1MConfig;
+
     fn info() -> &'static Info;
 }
 
@@ -245,6 +249,9 @@ macro_rules! impl_wwdt_instance {
     ($n:literal) => {
         paste::paste! {
             impl $crate::wwdt::SealedInstance for $crate::peripherals::[<WWDT $n>] {
+                const CLOCK_CONFIG: $crate::clocks::periph_helpers::Clk1MConfig =
+                    $crate::clocks::periph_helpers::Clk1MConfig::for_wwdt($n);
+
                 fn info() -> &'static $crate::wwdt::Info {
                     static INFO: $crate::wwdt::Info = $crate::wwdt::Info {
                         regs: $crate::pac::[<WWDT $n>],
