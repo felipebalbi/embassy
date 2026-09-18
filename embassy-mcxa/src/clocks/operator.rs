@@ -14,8 +14,8 @@ use crate::chips::{ClockLimits, clock_limits};
 use crate::pac;
 use crate::pac::cmc::Ckmode;
 use crate::pac::scg::{
-    Erefs, Fircacc, FircaccIe, FirccsrLk, Fircerr, FircerrIe, Fircsten, Range, Scs, SirccsrLk, Sircerr, Sircvld,
-    SosccsrLk, Soscerr, Source, SpllLock, SpllcsrLk, Spllerr, Spllsten, TrimUnlock,
+    Fircacc, FircaccIe, FirccsrLk, Fircerr, FircerrIe, Fircsten, Scs, SirccsrLk, Sircerr, Sircvld, SosccsrLk, Soscerr,
+    Source, SpllLock, SpllcsrLk, Spllerr, Spllsten, TrimUnlock,
 };
 use crate::pac::spc::{ActiveCfgCoreldoVddDs, LpCfgBgmode};
 use crate::pac::syscon::{
@@ -471,16 +471,7 @@ impl ClockOperator<'_> {
         Ok(())
     }
 
-    fn ensure_ldo_active(&mut self, for_clock: &'static str, for_power: &PoweredClock) -> Result<(), ClockError> {
-        let bg_good =
-            calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, *for_power);
-        if !bg_good {
-            return Err(ClockError::BadConfig {
-                clock: for_clock,
-                reason: "LDO requires core bandgap enabled",
-            });
-        }
-
+    fn ensure_ldo_active(&mut self) {
         // TODO: Config for the LDO? For now, just enable
         // using the default settings:
         // LDOBYPASS: 0/not bypassed
@@ -494,47 +485,23 @@ impl ClockOperator<'_> {
             self.scg0.ldocsr().modify(|w| w.set_ldoen(true));
             while !self.scg0.ldocsr().read().vout_ok() {}
         }
-
-        Ok(())
     }
 
     /// Configure the SOSC/clk_in oscillator
     #[cfg(not(feature = "sosc-as-gpio"))]
     pub(super) fn configure_sosc(&mut self) -> Result<(), ClockError> {
-        let Some(parts) = self.config.sosc.as_ref() else {
+        use super::program::SoscProgram;
+
+        let SoscProgram::Enabled { erefs, range, soscsten } = self.resolved.sosc else {
             return Ok(());
         };
 
         // Enable (and wait for) LDO to be active
-        self.ensure_ldo_active("sosc", &parts.power)?;
-
-        let eref = match parts.mode {
-            config::SoscMode::CrystalOscillator => Erefs::Internal,
-            config::SoscMode::ActiveClock => Erefs::External,
-        };
-        let freq = parts.frequency;
-
-        // TODO: Fix PAC names here
-        //
-        // #[doc = "0: Frequency range select of 8-16 MHz."]
-        // Freq16to20mhz = 0,
-        // #[doc = "1: Frequency range select of 16-25 MHz."]
-        // LowFreq = 1,
-        // #[doc = "2: Frequency range select of 25-40 MHz."]
-        // MediumFreq = 2,
-        // #[doc = "3: Frequency range select of 40-50 MHz."]
-        // HighFreq = 3,
-        let range = match calc::sosc_range(freq) {
-            Ok(calc::SoscRange::Freq8To16Mhz) => Range::Freq16to20mhz,
-            Ok(calc::SoscRange::Freq16To25Mhz) => Range::LowFreq,
-            Ok(calc::SoscRange::Freq25To40Mhz) => Range::MediumFreq,
-            Ok(calc::SoscRange::Freq40To50Mhz) => Range::HighFreq,
-            Err(e) => return Err(e),
-        };
+        self.ensure_ldo_active();
 
         // Set source/erefs and range
         self.scg0.sosccfg().modify(|w| {
-            w.set_erefs(eref);
+            w.set_erefs(erefs);
             w.set_range(range);
         });
 
@@ -548,19 +515,6 @@ impl ClockOperator<'_> {
         // * If SOSC needs to work in deep sleep, AND the monitor is enabled:
         //   * SIRC also need needs to be low power
         // * We need to decide if we need an interrupt or a reset if the monitor trips
-        let bg_good =
-            calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, parts.power);
-        let soscsten = match parts.power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => false,
-            PoweredClock::AlwaysEnabled => true,
-        };
-
-        if !bg_good {
-            return Err(ClockError::BadConfig {
-                clock: "sosc",
-                reason: "bandgap required",
-            });
-        }
 
         // Apply remaining config
         self.scg0.sosccsr().modify(|w| {
@@ -586,10 +540,7 @@ impl ClockOperator<'_> {
         // Re-lock the sosc
         self.scg0.sosccsr().modify(|w| w.set_lk(SosccsrLk::WriteDisabled));
 
-        self.clocks.clk_in = Some(Clock {
-            frequency: freq,
-            power: parts.power,
-        });
+        self.clocks.clk_in = self.resolved.clocks.clk_in.clone();
 
         Ok(())
     }
@@ -616,7 +567,9 @@ impl ClockOperator<'_> {
         };
 
         // Ensure the LDO is active
-        self.ensure_ldo_active("spll", &cfg.power)?;
+        //
+        // NOTE: the bandgap requirement is enforced during resolution, before we get here.
+        self.ensure_ldo_active();
 
         // match on the source, ensure it is active already
         let res = match cfg.source {

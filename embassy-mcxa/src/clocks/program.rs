@@ -12,6 +12,8 @@
 
 use super::config::CoreSleep;
 use super::types::Clocks;
+#[cfg(not(feature = "sosc-as-gpio"))]
+use crate::pac::scg::{Erefs, Range};
 use crate::pac::scg::{Fircsten, FreqSel};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
@@ -34,6 +36,28 @@ pub(super) struct ResolvedClockProgram {
     /// The values `configure_osc32k_clocks` needs.
     #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
     pub(super) osc32k: Osc32KProgram,
+    /// The values `configure_sosc` needs.
+    #[cfg(not(feature = "sosc-as-gpio"))]
+    pub(super) sosc: SoscProgram,
+}
+
+/// Everything `configure_sosc` derives from the configuration.
+#[cfg(not(feature = "sosc-as-gpio"))]
+pub(super) enum SoscProgram {
+    /// No SOSC configuration was requested; `configure_sosc` touches no registers.
+    Absent,
+    /// A SOSC configuration was requested.
+    ///
+    /// The resulting frequency and power live in
+    /// [`ResolvedClockProgram::clocks`], as `clk_in`.
+    Enabled {
+        /// `SOSCCFG[EREFS]`.
+        erefs: Erefs,
+        /// `SOSCCFG[RANGE]`.
+        range: Range,
+        /// `SOSCCSR[SOSCSTEN]`.
+        soscsten: bool,
+    },
 }
 
 /// Everything `configure_osc32k_clocks` derives from the configuration.

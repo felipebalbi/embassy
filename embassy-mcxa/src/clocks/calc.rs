@@ -5,11 +5,15 @@
 //! from the `configure_*` methods in [`super::operator`] so that they can also
 //! be evaluated at compile time.
 
+#[cfg(not(feature = "sosc-as-gpio"))]
+use super::config::SoscMode;
 use super::config::{
     ClocksConfig, Div8, FircFreqSel, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
 };
 #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
 use super::program::Osc32KProgram;
+#[cfg(not(feature = "sosc-as-gpio"))]
+use super::program::SoscProgram;
 use super::program::{
     ActiveDrive, ActiveProgram, FircProgram, Fro16KProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram,
     SircProgram, VoltageProgram,
@@ -17,6 +21,8 @@ use super::program::{
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::ClockLimits;
 use crate::pac::scg::Fircsten;
+#[cfg(not(feature = "sosc-as-gpio"))]
+use crate::pac::scg::{Erefs, Range};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -838,6 +844,8 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     // SOSC: mirrors `configure_sosc`.
     //
     #[cfg(not(feature = "sosc-as-gpio"))]
+    let mut sosc_program = SoscProgram::Absent;
+    #[cfg(not(feature = "sosc-as-gpio"))]
     if let Some(parts) = config.sosc.as_ref() {
         // `configure_sosc` performs this check via `ensure_ldo_active`.
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, parts.power) {
@@ -847,10 +855,23 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
             });
         }
 
-        match sosc_range(parts.frequency) {
-            Ok(_) => {}
+        // TODO: Fix PAC names here
+        //
+        // #[doc = "0: Frequency range select of 8-16 MHz."]
+        // Freq16to20mhz = 0,
+        // #[doc = "1: Frequency range select of 16-25 MHz."]
+        // LowFreq = 1,
+        // #[doc = "2: Frequency range select of 25-40 MHz."]
+        // MediumFreq = 2,
+        // #[doc = "3: Frequency range select of 40-50 MHz."]
+        // HighFreq = 3,
+        let range = match sosc_range(parts.frequency) {
+            Ok(SoscRange::Freq8To16Mhz) => Range::Freq16to20mhz,
+            Ok(SoscRange::Freq16To25Mhz) => Range::LowFreq,
+            Ok(SoscRange::Freq25To40Mhz) => Range::MediumFreq,
+            Ok(SoscRange::Freq40To50Mhz) => Range::HighFreq,
             Err(e) => return Err(e),
-        }
+        };
 
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, parts.power) {
             return Err(ClockError::BadConfig {
@@ -858,6 +879,18 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 reason: "bandgap required",
             });
         }
+
+        sosc_program = SoscProgram::Enabled {
+            erefs: match parts.mode {
+                SoscMode::CrystalOscillator => Erefs::Internal,
+                SoscMode::ActiveClock => Erefs::External,
+            },
+            range,
+            soscsten: match parts.power {
+                PoweredClock::NormalEnabledDeepSleepDisabled => false,
+                PoweredClock::AlwaysEnabled => true,
+            },
+        };
 
         clocks.clk_in = Some(Clock {
             frequency: parts.frequency,
@@ -1101,5 +1134,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         fro16k: fro16k_program,
         #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
         osc32k: osc32k_program,
+        #[cfg(not(feature = "sosc-as-gpio"))]
+        sosc: sosc_program,
     })
 }
