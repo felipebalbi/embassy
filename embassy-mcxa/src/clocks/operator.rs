@@ -197,7 +197,7 @@ impl ClockOperator<'_> {
         if self.scg0.sirccsr().read().sircerr() == Sircerr::ErrorDetected {
             return Err(ClockError::BadConfig {
                 clock: "sirc",
-                reason: "error set",
+                reason: "sirc error flag set",
             });
         }
 
@@ -491,7 +491,7 @@ impl ClockOperator<'_> {
         if self.scg0.sosccsr().read().soscerr() == Soscerr::EnabledAndError {
             return Err(ClockError::BadConfig {
                 clock: "clk_in",
-                reason: "soscerr is set",
+                reason: "sosc error flag set",
             });
         }
 
@@ -621,7 +621,7 @@ impl ClockOperator<'_> {
                 if csr.spllerr() == Spllerr::EnabledAndError {
                     return Err(ClockError::BadConfig {
                         clock: "spll",
-                        reason: "spllerr is set",
+                        reason: "spll error flag set",
                     });
                 }
                 break;

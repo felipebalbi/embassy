@@ -99,7 +99,7 @@ pub(super) const fn sosc_range(frequency: u32) -> Result<SoscRange, ClockError> 
     if frequency < 8_000_000 {
         Err(ClockError::BadConfig {
             clock: "clk_in",
-            reason: "freq too low",
+            reason: "clk_in frequency below minimum",
         })
     } else if frequency < 16_000_000 {
         Ok(SoscRange::Freq8To16Mhz)
@@ -112,7 +112,7 @@ pub(super) const fn sosc_range(frequency: u32) -> Result<SoscRange, ClockError> 
     } else {
         Err(ClockError::BadConfig {
             clock: "clk_in",
-            reason: "freq too high",
+            reason: "clk_in frequency above maximum",
         })
     }
 }
@@ -126,7 +126,7 @@ pub(super) const fn check_spll_m(m: u16) -> Result<u16, ClockError> {
     if m < 1 || m > u16::MAX {
         Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "m_mult out of range",
+            reason: "spll feedback multiplier out of range",
         })
     } else {
         Ok(m)
@@ -138,7 +138,7 @@ pub(super) const fn check_spll_p(p: u8) -> Result<u8, ClockError> {
     if p < 1 || p > 31 {
         Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "p_div out of range",
+            reason: "spll postdivider out of range",
         })
     } else {
         Ok(p)
@@ -150,7 +150,7 @@ pub(super) const fn check_spll_n(n: u8) -> Result<u8, ClockError> {
     if n < 1 || n > u8::MAX {
         Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "n_div out of range",
+            reason: "spll predivider out of range",
         })
     } else {
         Ok(n)
@@ -193,7 +193,7 @@ pub(super) const fn require_spll_fcco(v: Option<u32>) -> Result<u32, ClockError>
         Some(v) => Ok(v),
         None => Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "fcco invalid1",
+            reason: "spll CCO frequency calculation overflows u32",
         }),
     }
 }
@@ -204,7 +204,7 @@ pub(super) const fn require_spll_fout(v: Option<u32>) -> Result<u32, ClockError>
         Some(v) => Ok(v),
         None => Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "fout invalid",
+            reason: "spll output frequency calculation overflows u32",
         }),
     }
 }
@@ -214,7 +214,7 @@ pub(super) const fn validate_spll_fcco(fcco: u32) -> Result<(), ClockError> {
     if fcco < 275_000_000 || fcco > 550_000_000 {
         Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "fcco invalid2",
+            reason: "spll CCO frequency outside 275-550 MHz",
         })
     } else {
         Ok(())
@@ -230,7 +230,7 @@ pub(super) const fn validate_spll_fout(fout: u32, limits: &ClockLimits) -> Resul
     if spll_range_bad1 || spll_range_bad2 {
         Err(ClockError::BadConfig {
             clock: "spll",
-            reason: "fout invalid",
+            reason: "spll output frequency outside allowed range",
         })
     } else {
         Ok(())
@@ -353,7 +353,7 @@ pub(super) const fn bandgap_meets_requirement(active: bool, low_power: bool, for
 pub(super) const fn vdd_level_transition(active: VddLevel, low_power: VddLevel) -> Result<(bool, u16), ClockError> {
     const BAD_ASCENDING: Result<(bool, u16), ClockError> = Err(ClockError::BadConfig {
         clock: "vdd_power",
-        reason: "Deep sleep can't have higher level than active mode",
+        reason: "vdd_power deep-sleep level exceeds active level",
     });
 
     match (active, low_power) {
@@ -449,7 +449,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     if ds_match && !vdd_match {
         return Err(ClockError::BadConfig {
             clock: "vdd_power",
-            reason: "DS matches but LVL mismatches!",
+            reason: "vdd_power deep-sleep match has different voltage level",
         });
     }
     let bandgap_active = bandgap_enabled(config.vdd_power.active_mode.drive);
@@ -572,7 +572,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !config.sirc.fro_12m_enabled {
             return Err(ClockError::BadConfig {
                 clock: "fro_lf_div",
-                reason: "fro_12m not enabled",
+                reason: "fro_lf_div requires fro_12m",
             });
         }
         clocks.fro_lf_div = Some(Clock {
@@ -633,12 +633,12 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, firc.power) {
             return Err(ClockError::BadConfig {
                 clock: "fro_hf",
-                reason: "bandgap required to be enabled when clock enabled",
+                reason: "fro_hf requires core bandgap",
             });
         }
 
         if firc.fro_hf_enabled {
-            match validate_max_frequency(base_freq, limits.fro_hf, "fro_hf", "exceeds max") {
+            match validate_max_frequency(base_freq, limits.fro_hf, "fro_hf", "fro_hf exceeds maximum frequency") {
                 Ok(()) => {}
                 Err(e) => return Err(e),
             }
@@ -662,11 +662,16 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
             if !firc.fro_hf_enabled {
                 return Err(ClockError::BadConfig {
                     clock: "fro_hf_div",
-                    reason: "fro_hf not enabled",
+                    reason: "fro_hf_div requires fro_hf",
                 });
             }
             let div_freq = divided_frequency(base_freq, *d);
-            match validate_max_frequency(div_freq, limits.fro_hf_div, "fro_hf_root", "exceeds max frequency") {
+            match validate_max_frequency(
+                div_freq,
+                limits.fro_hf_div,
+                "fro_hf_root",
+                "fro_hf_div exceeds maximum frequency",
+            ) {
                 Ok(()) => {}
                 Err(e) => return Err(e),
             }
@@ -851,7 +856,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, parts.power) {
             return Err(ClockError::BadConfig {
                 clock: "sosc",
-                reason: "LDO requires core bandgap enabled",
+                reason: "sosc requires core bandgap",
             });
         }
 
@@ -876,7 +881,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, parts.power) {
             return Err(ClockError::BadConfig {
                 clock: "sosc",
-                reason: "bandgap required",
+                reason: "sosc requires core bandgap",
             });
         }
 
@@ -907,16 +912,20 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, cfg.power) {
             return Err(ClockError::BadConfig {
                 clock: "spll",
-                reason: "LDO requires core bandgap enabled",
+                reason: "spll requires core bandgap",
             });
         }
 
         // match on the source, ensure it is active already
         let (src, missing, variant) = match cfg.source {
             #[cfg(not(feature = "sosc-as-gpio"))]
-            SpllSource::Sosc => (clocks.clk_in.as_ref(), "sosc not active", Source::Sosc),
-            SpllSource::Firc => (clocks.clk_hf_fundamental.as_ref(), "firc not active", Source::Firc),
-            SpllSource::Sirc => (clocks.fro_12m.as_ref(), "sirc not active", Source::Sirc),
+            SpllSource::Sosc => (clocks.clk_in.as_ref(), "spll source sosc not active", Source::Sosc),
+            SpllSource::Firc => (
+                clocks.clk_hf_fundamental.as_ref(),
+                "spll source firc not active",
+                Source::Firc,
+            ),
+            SpllSource::Sirc => (clocks.fro_12m.as_ref(), "spll source sirc not active", Source::Sirc),
         };
         // This checks if active
         let Some(clk) = src else {
@@ -929,13 +938,13 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !clk.power.meets_requirement_of(&cfg.power) {
             return Err(ClockError::BadConfig {
                 clock: "spll",
-                reason: "needs low power source",
+                reason: "spll requires a low-power source",
             });
         }
         if clk.frequency == 0 {
             return Err(ClockError::BadConfig {
                 clock: "spll",
-                reason: "internal error",
+                reason: "spll source frequency is zero",
             });
         }
 
@@ -1066,7 +1075,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         if !bandgap_meets_requirement(bandgap_active, bandgap_lowpower, cfg.power) {
             return Err(ClockError::BadConfig {
                 clock: "spll",
-                reason: "bandgap required when active",
+                reason: "spll requires core bandgap",
             });
         }
 
@@ -1078,7 +1087,12 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         let mut pll1_clk_div_bits = None;
         if let Some(d) = cfg.pll1_clk_div.as_ref() {
             let exp_freq = divided_frequency(fout, *d);
-            match validate_max_frequency(exp_freq, limits.pll1_clk_div, "pll1_clk_div", "exceeds max frequency") {
+            match validate_max_frequency(
+                exp_freq,
+                limits.pll1_clk_div,
+                "pll1_clk_div",
+                "pll1_clk_div exceeds maximum frequency",
+            ) {
                 Ok(()) => {}
                 Err(e) => return Err(e),
             }
@@ -1137,14 +1151,14 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     let Some(main_clk_src) = src else {
         return Err(ClockError::BadConfig {
             clock: name,
-            reason: "Needed for main_clock but not enabled",
+            reason: "main clock source is not enabled",
         });
     };
 
     if !main_clk_src.power.meets_requirement_of(&config.main_clock.power) {
         return Err(ClockError::BadConfig {
             clock: name,
-            reason: "Needed for main_clock but not low power",
+            reason: "main clock source is unavailable in low power",
         });
     }
 
@@ -1155,7 +1169,12 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
 
     // Is the main_clk source in range for main_clk?
     let lowest_limits = lowest_relevant_limits(active_power, lp_power, config.main_clock.power);
-    match validate_max_frequency(main_freq, lowest_limits.main_clk, name, "Exceeds main_clock frequency") {
+    match validate_max_frequency(
+        main_freq,
+        lowest_limits.main_clk,
+        name,
+        "main_clk exceeds maximum frequency",
+    ) {
         Ok(()) => {}
         Err(e) => return Err(e),
     }
@@ -1169,7 +1188,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         cpu_freq,
         active_limits(active_power).cpu_clk,
         name,
-        "Exceeds ahb max frequency",
+        "cpu_clk after ahb_clk_div exceeds maximum frequency",
     ) {
         Ok(()) => {}
         Err(e) => return Err(e),

@@ -363,7 +363,7 @@ impl DacConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "dac fclk",
-                reason: "exceeds max rating",
+                reason: "dac fclk exceeds maximum rating",
             });
         }
 
@@ -546,7 +546,7 @@ impl AdcConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "adc fclk",
-                reason: "exceeds max rating",
+                reason: "adc fclk exceeds maximum rating",
             });
         }
 
@@ -827,7 +827,7 @@ impl LpspiConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "lpspi fclk",
-                reason: "exceeds max rating",
+                reason: "lpspi fclk exceeds maximum rating",
             });
         }
 
@@ -963,12 +963,12 @@ pub struct FlexspiConfig {
 /// [`crate::flexspi::ClockConfig`] - which carries no instance - can run the
 /// exact same check at compile time.
 ///
-/// # Reachability of the `"exceeds max rating"` branch
+/// # Reachability of the `"flexspi fclk exceeds maximum rating"` branch
 ///
 /// Empirical finding: the `fmax` values below coincide EXACTLY with the maximum
 /// legal clock-tree frequencies in mid-drive (96 MHz) and normal-drive (240 MHz).
-/// Because the comparison is a strict `>`, the `"exceeds max rating"` error is
-/// therefore UNREACHABLE in those two modes. It can only fire in over-drive, where
+/// Because the comparison is a strict `>`, the `"flexspi fclk exceeds maximum rating"`
+/// error is therefore UNREACHABLE in those two modes. It can only fire in over-drive, where
 /// `pll1_clk` (400 MHz) rather than `2 * cpu_clk` becomes binding and exceeds the
 /// 320 MHz FlexSPI limit.
 ///
@@ -1011,7 +1011,7 @@ pub(crate) const fn validate_flexspi_clock(
     if (freq as u64) > (fmax as u64) * (div as u64) {
         return Err(ClockError::BadConfig {
             clock: "flexspi fclk",
-            reason: "exceeds max rating",
+            reason: "flexspi fclk exceeds maximum rating",
         });
     }
 
@@ -1148,7 +1148,7 @@ impl I3cConfig {
         if (freq as u64) > (I3C_FCLK_MAX as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "i3c fclk",
-                reason: "exceeds max rating",
+                reason: "i3c fclk exceeds maximum rating",
             });
         }
 
@@ -1337,7 +1337,7 @@ impl Lpi2cConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "lpi2c fclk",
-                reason: "exceeds max rating",
+                reason: "lpi2c fclk exceeds maximum rating",
             });
         }
 
@@ -1523,7 +1523,7 @@ impl LpuartConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "lpuart fclk",
-                reason: "exceeds max rating",
+                reason: "lpuart fclk exceeds maximum rating",
             });
         }
 
@@ -1735,7 +1735,7 @@ impl CTimerConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "ctimer fclk",
-                reason: "exceeds max rating",
+                reason: "ctimer fclk exceeds maximum rating",
             });
         }
 
@@ -1929,7 +1929,7 @@ impl CanConfig {
         if (freq as u64) > (fmax as u64) * (div as u64) {
             return Err(ClockError::BadConfig {
                 clock: "flexcan fclk",
-                reason: "exceeds max rating",
+                reason: "flexcan fclk exceeds maximum rating",
             });
         }
 

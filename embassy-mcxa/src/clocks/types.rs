@@ -230,18 +230,20 @@ impl Clocks {
         &self,
         clock: &Option<Clock>,
         name: &'static str,
+        inactive_reason: &'static str,
+        low_power_reason: &'static str,
         at_level: &PoweredClock,
     ) -> Result<u32, ClockError> {
         let Some(clk) = clock.as_ref() else {
             return Err(ClockError::BadConfig {
                 clock: name,
-                reason: "required but not active",
+                reason: inactive_reason,
             });
         };
         if !clk.power.meets_requirement_of(at_level) {
             return Err(ClockError::BadConfig {
                 clock: name,
-                reason: "not low power active",
+                reason: low_power_reason,
             });
         }
         Ok(clk.frequency)
@@ -250,26 +252,50 @@ impl Clocks {
     /// Ensure the `fro_lf_div` clock is active and valid at the given power state.
     #[inline]
     pub const fn ensure_fro_lf_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.fro_lf_div, "fro_lf_div", at_level)
+        self.ensure_clock_active(
+            &self.fro_lf_div,
+            "fro_lf_div",
+            "fro_lf_div required but not active",
+            "fro_lf_div unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `fro_hf` clock is active and valid at the given power state.
     #[inline]
     pub const fn ensure_fro_hf_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.fro_hf, "fro_hf", at_level)
+        self.ensure_clock_active(
+            &self.fro_hf,
+            "fro_hf",
+            "fro_hf required but not active",
+            "fro_hf unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `fro_hf_div` clock is active and valid at the given power state.
     #[inline]
     pub const fn ensure_fro_hf_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.fro_hf_div, "fro_hf_div", at_level)
+        self.ensure_clock_active(
+            &self.fro_hf_div,
+            "fro_hf_div",
+            "fro_hf_div required but not active",
+            "fro_hf_div unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `clk_in` clock is active and valid at the given power state.
     #[cfg(not(feature = "sosc-as-gpio"))]
     #[inline]
     pub const fn ensure_clk_in_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.clk_in, "clk_in", at_level)
+        self.ensure_clock_active(
+            &self.clk_in,
+            "clk_in",
+            "clk_in required but not active",
+            "clk_in unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `clk_16k_vsys` clock is active and valid at the given power state.
@@ -280,7 +306,7 @@ impl Clocks {
             .as_ref()
             .ok_or(ClockError::BadConfig {
                 clock: "clk_16k_vsys",
-                reason: "required but not active",
+                reason: "clk_16k_vsys required but not active",
             })?
             .frequency)
     }
@@ -292,7 +318,7 @@ impl Clocks {
             Some(clock) => Ok(clock.frequency),
             None => Err(ClockError::BadConfig {
                 clock: "clk_16k_vdd_core",
-                reason: "required but not active",
+                reason: "clk_16k_vdd_core required but not active",
             }),
         }
     }
@@ -305,7 +331,7 @@ impl Clocks {
             Some(clock) => Ok(clock.frequency),
             None => Err(ClockError::BadConfig {
                 clock: "clk_16k_vbat",
-                reason: "required but not active",
+                reason: "clk_16k_vbat required but not active",
             }),
         }
     }
@@ -314,39 +340,75 @@ impl Clocks {
     #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     #[inline]
     pub fn ensure_clk_32k_vsys_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.clk_32k_vsys, "clk_32k_vsys", at_level)
+        self.ensure_clock_active(
+            &self.clk_32k_vsys,
+            "clk_32k_vsys",
+            "clk_32k_vsys required but not active",
+            "clk_32k_vsys unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `clk_32k_vdd_core` clock is active and valid at the given power state.
     #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     #[inline]
     pub fn ensure_clk_32k_vdd_core_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.clk_32k_vdd_core, "clk_32k_vdd_core", at_level)
+        self.ensure_clock_active(
+            &self.clk_32k_vdd_core,
+            "clk_32k_vdd_core",
+            "clk_32k_vdd_core required but not active",
+            "clk_32k_vdd_core unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `clk_32k_vbat` clock is active and valid at the given power state.
     #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     #[inline]
     pub fn ensure_clk_32k_vbat_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.clk_32k_vbat, "clk_32k_vbat", at_level)
+        self.ensure_clock_active(
+            &self.clk_32k_vbat,
+            "clk_32k_vbat",
+            "clk_32k_vbat required but not active",
+            "clk_32k_vbat unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `clk_1m` clock is active and valid at the given power state.
     #[inline]
     pub const fn ensure_clk_1m_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.clk_1m, "clk_1m", at_level)
+        self.ensure_clock_active(
+            &self.clk_1m,
+            "clk_1m",
+            "clk_1m required but not active",
+            "clk_1m unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `pll1_clk` clock is active and valid at the given power state.
     #[inline]
     pub const fn ensure_pll1_clk_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.pll1_clk, "pll1_clk", at_level)
+        self.ensure_clock_active(
+            &self.pll1_clk,
+            "pll1_clk",
+            "pll1_clk required but not active",
+            "pll1_clk unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `pll1_clk_div` clock is active and valid at the given power state.
     #[inline]
     pub const fn ensure_pll1_clk_div_active(&self, at_level: &PoweredClock) -> Result<u32, ClockError> {
-        self.ensure_clock_active(&self.pll1_clk_div, "pll1_clk_div", at_level)
+        self.ensure_clock_active(
+            &self.pll1_clk_div,
+            "pll1_clk_div",
+            "pll1_clk_div required but not active",
+            "pll1_clk_div unavailable in low power",
+            at_level,
+        )
     }
 
     /// Ensure the `CPU_CLK` or `SYSTEM_CLK` is active
@@ -354,7 +416,7 @@ impl Clocks {
         let Some(clk) = self.cpu_system_clk.as_ref() else {
             return Err(ClockError::BadConfig {
                 clock: "cpu_system_clk",
-                reason: "required but not active",
+                reason: "cpu_system_clk required but not active",
             });
         };
 
@@ -364,7 +426,7 @@ impl Clocks {
             PoweredClock::AlwaysEnabled => {
                 return Err(ClockError::BadConfig {
                     clock: "main_clk",
-                    reason: "not low power active",
+                    reason: "cpu_system_clk unavailable in low power",
                 });
             }
         }

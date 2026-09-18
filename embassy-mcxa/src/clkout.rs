@@ -179,7 +179,7 @@ fn check_sel(sel: ClockOutSel, level: PoweredClock, divisor: u32) -> Result<(u32
         if expected > fmax {
             Err(ClockError::BadConfig {
                 clock: "clkout fclk",
-                reason: "exceeds fclk max",
+                reason: "clkout fclk exceeds maximum frequency",
             })
         } else {
             let wg = WakeGuard::for_power(&level);
