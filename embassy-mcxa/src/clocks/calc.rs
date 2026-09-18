@@ -9,7 +9,7 @@ use super::config::{
     ClocksConfig, Div8, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
 };
 use super::program::{
-    ActiveDrive, ActiveProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram, VoltageProgram,
+    ActiveDrive, ActiveProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram, SircProgram, VoltageProgram,
 };
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::ClockLimits;
@@ -535,6 +535,11 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     // SIRC: mirrors `configure_sirc_clocks_early`.
     //
     let sirc_freq = FRO_12M_FREQUENCY;
+    let sirc_deep = match config.sirc.power {
+        PoweredClock::NormalEnabledDeepSleepDisabled => false,
+        PoweredClock::AlwaysEnabled => true,
+    };
+    let mut sirc_fro_lf_div_bits = None;
     clocks.fro_12m_root = Some(Clock {
         frequency: sirc_freq,
         power: config.sirc.power,
@@ -562,7 +567,17 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
             frequency: divided_frequency(sirc_freq, *d),
             power: config.sirc.power,
         });
+        sirc_fro_lf_div_bits = Some(d.into_bits());
     }
+
+    // NOTE: `sirc_forced` is resolved directly from the requested configuration.
+    // It deliberately is NOT inferred from `clocks.fro_12m.is_none()`, which is
+    // ambiguous.
+    let sirc = SircProgram {
+        deep: sirc_deep,
+        fro_lf_div_bits: sirc_fro_lf_div_bits,
+        sirc_forced: !config.sirc.fro_12m_enabled,
+    };
 
     //
     // FIRC: mirrors `configure_firc_clocks`.
@@ -944,5 +959,5 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         power: main_power,
     });
 
-    Ok(ResolvedClockProgram { clocks, voltage })
+    Ok(ResolvedClockProgram { clocks, voltage, sirc })
 }

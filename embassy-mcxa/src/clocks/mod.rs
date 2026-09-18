@@ -241,7 +241,6 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
         clocks: &mut clocks,
         config: &settings,
         resolved: &resolved,
-        sirc_forced: false,
 
         _mrcc0: pac::MRCC0,
         scg0: pac::SCG0,

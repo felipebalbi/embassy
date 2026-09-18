@@ -22,6 +22,19 @@ pub(super) struct ResolvedClockProgram {
     pub(super) clocks: Clocks,
     /// The values `configure_voltages` needs.
     pub(super) voltage: VoltageProgram,
+    /// The values `configure_sirc_clocks_early`/`_late` need.
+    pub(super) sirc: SircProgram,
+}
+
+/// Everything the SIRC/FRO12M configuration steps derive from the configuration.
+pub(super) struct SircProgram {
+    /// `SIRCCSR[SIRCSTEN]`.
+    pub(super) deep: bool,
+    /// `SYSCON[FROLFDIV.DIV]`, if the `fro_lf_div` output is enabled.
+    pub(super) fro_lf_div_bits: Option<u8>,
+    /// SIRC's `fro_12m` is force-enabled until `main_clk` is selected, and must be
+    /// gated off again by `configure_sirc_clocks_late`.
+    pub(super) sirc_forced: bool,
 }
 
 /// Everything `configure_voltages` derives from the configuration.

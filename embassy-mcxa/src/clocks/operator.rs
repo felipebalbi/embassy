@@ -3,7 +3,7 @@
 //! This module contains the private `ClockOperator` struct and all of its
 //! `configure_*` methods. It is only used during [`super::init()`].
 
-use config::{ClocksConfig, CoreSleep, FircConfig, FircFreqSel, Fro16KConfig, MainClockSource, SircConfig, VddLevel};
+use config::{ClocksConfig, CoreSleep, FircConfig, FircFreqSel, Fro16KConfig, MainClockSource, VddLevel};
 use cortex_m::peripheral::SCB;
 
 use super::calc;
@@ -38,9 +38,6 @@ pub(super) struct ClockOperator<'a> {
     pub(super) config: &'a ClocksConfig,
     /// The fully-resolved program that this operator applies to hardware
     pub(super) resolved: &'a ResolvedClockProgram,
-
-    /// SIRC is forced-on until we set `main_clk`
-    pub(super) sirc_forced: bool,
 
     // We hold on to stolen peripherals
     pub(super) _mrcc0: pac::mrcc::Mrcc,
@@ -263,43 +260,20 @@ impl ClockOperator<'_> {
 
     /// Configure the SIRC/FRO12M clock family
     pub(super) fn configure_sirc_clocks_early(&mut self) -> Result<(), ClockError> {
-        let SircConfig {
-            power,
-            fro_12m_enabled,
-            fro_lf_div,
-        } = &self.config.sirc;
-        let base_freq = calc::FRO_12M_FREQUENCY;
-
         // Allow writes
         self.scg0.sirccsr().modify(|w| w.set_lk(SirccsrLk::WriteEnabled));
-        self.clocks.fro_12m_root = Some(Clock {
-            frequency: base_freq,
-            power: *power,
-        });
+        self.clocks.fro_12m_root = self.resolved.clocks.fro_12m_root.clone();
 
-        let deep = match power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => false,
-            PoweredClock::AlwaysEnabled => true,
-        };
+        let deep = self.resolved.sirc.deep;
 
         // clk_1m is *before* the fro_12m clock gate
-        self.clocks.clk_1m = Some(Clock {
-            frequency: calc::clk_1m_frequency(base_freq),
-            power: *power,
-        });
+        self.clocks.clk_1m = self.resolved.clocks.clk_1m.clone();
 
         // If the user wants fro_12m to be disabled, FOR now, we ignore their
         // wish to ensure fro_12m is selectable as a main_clk source at least until
         // we select the CPU clock. We still mark it as not enabled though, to prevent
         // other peripherals using it, as we will gate if off at `configure_sirc_clocks_late`.
-        if *fro_12m_enabled {
-            self.clocks.fro_12m = Some(Clock {
-                frequency: base_freq,
-                power: *power,
-            });
-        } else {
-            self.sirc_forced = true;
-        };
+        self.clocks.fro_12m = self.resolved.clocks.fro_12m.clone();
 
         // Set sleep/peripheral usage
         self.scg0.sirccsr().modify(|w| {
@@ -320,36 +294,28 @@ impl ClockOperator<'_> {
         self.scg0.sirccsr().modify(|w| w.set_lk(SirccsrLk::WriteDisabled));
 
         // Do we enable the `fro_lf_div` output?
-        if let Some(d) = fro_lf_div.as_ref() {
-            // We need `fro_lf` to be enabled
-            if !*fro_12m_enabled {
-                return Err(ClockError::BadConfig {
-                    clock: "fro_lf_div",
-                    reason: "fro_12m not enabled",
-                });
-            }
-
+        //
+        // NOTE: the `fro_lf_div` requires `fro_12m` dependency is enforced during
+        // resolution, before we get here.
+        if let Some(div) = self.resolved.sirc.fro_lf_div_bits {
             // Halt and reset the div; then set our desired div.
             self.syscon.frolfdiv().write(|w| {
                 w.set_halt(FrolfdivHalt::Halt);
                 w.set_reset(FrolfdivReset::Asserted);
-                w.set_div(d.into_bits());
+                w.set_div(div);
             });
             // Then unhalt it, and reset it
             self.syscon.frolfdiv().modify(|w| {
                 w.set_halt(FrolfdivHalt::Run);
                 w.set_reset(FrolfdivReset::Released);
-                w.set_div(d.into_bits());
+                w.set_div(div);
             });
 
             // Wait for clock to stabilize
             while self.syscon.frolfdiv().read().unstab() == FrolfdivUnstab::Ongoing {}
 
             // Store off the clock info
-            self.clocks.fro_lf_div = Some(Clock {
-                frequency: calc::divided_frequency(base_freq, *d),
-                power: *power,
-            });
+            self.clocks.fro_lf_div = self.resolved.clocks.fro_lf_div.clone();
         }
 
         Ok(())
@@ -357,7 +323,7 @@ impl ClockOperator<'_> {
 
     pub(super) fn configure_sirc_clocks_late(&mut self) {
         // If we forced SIRC's fro_12m to be enabled, disable it now.
-        if self.sirc_forced {
+        if self.resolved.sirc.sirc_forced {
             // Allow writes
             self.scg0.sirccsr().modify(|w| w.set_lk(SirccsrLk::WriteEnabled));
 
