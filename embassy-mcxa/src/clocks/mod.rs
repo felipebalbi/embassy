@@ -87,16 +87,19 @@ pub use types::{Clock, ClockError, Clocks, PoweredClock, WakeGuard};
 /// the same `ClocksConfig` VALUE that `resolve()` accepted is the one supplied to
 /// runtime clock initialisation. It does NOT go further than that:
 ///
-/// * The const resolver ([`ClocksConfig::resolve()`], via the `calc` module) and the
-///   runtime clock operator (`operator::ClockOperator`, driven from [`init()`]) are
-///   two parallel implementations of the same clock tree. They share arithmetic
-///   helpers, which limits drift, but the control flow and state construction are
-///   duplicated. So this mechanism binds the INPUT CONFIGURATION; it does not prove
-///   that the runtime produces the [`Clocks`] tree that was asserted against, nor
-///   that the hardware realises it.
-/// * `resolve()` structurally cannot model hardware readiness - oscillator-valid
-///   bits, PLL lock, error flags, divider stability. Those are checked only at
-///   runtime, by the clock operator.
+/// * [`init()`] resolves the configuration exactly once through `calc::resolve_program()`,
+///   producing a `ResolvedClockProgram` that contains both the public [`Clocks`] state
+///   and every configuration-derived register value. `operator::ClockOperator` receives
+///   only a reference to that program: it holds no [`ClocksConfig`] and no mutable
+///   [`Clocks`], so it applies the resolved decisions rather than making them. The
+///   [`Clocks`] published to `CLOCKS` is the resolver's value, not a parallel
+///   reconstruction.
+/// * All pure validation happens during resolution, before [`init()`] touches a
+///   register. This structure does not prove hardware realisation: the operator could
+///   still apply a resolved value to the wrong register or omit a write.
+/// * Pure resolution cannot represent genuinely live hardware state, including the
+///   `CSR.SCS` read-back, LDO readiness, or any error/ready poll. Those checks
+///   necessarily remain local to the clock operator.
 pub struct ValidatedClocksConfig {
     config: ClocksConfig,
 }

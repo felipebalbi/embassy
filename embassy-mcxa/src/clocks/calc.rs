@@ -1,9 +1,9 @@
 //! Pure clock-tree arithmetic and validation helpers.
 //!
-//! Everything in this module is a `const fn` or a `const` item: no register
-//! access, no PAC types, no side effects. These items are extracted verbatim
-//! from the `configure_*` methods in [`super::operator`] so that they can also
-//! be evaluated at compile time.
+//! Everything in this module is a `const fn` or a `const` item: no register access
+//! and no side effects. It deliberately uses PAC enums as compile-time register
+//! values so that configuration-to-register mapping exists in exactly one place.
+//! The resolved program types are private, so no PAC type leaks into the public API.
 
 #[cfg(not(feature = "sosc-as-gpio"))]
 use super::config::SoscMode;
@@ -417,10 +417,10 @@ pub(super) const fn vdd_drive_matches(active: VddDriveStrength, low_power: VddDr
 /// Resolve a [`ClocksConfig`] into the [`Clocks`] state that [`super::init()`] would
 /// produce, without touching any hardware.
 ///
-/// This mirrors the phase ordering of [`super::init()`] exactly, and delegates every
-/// frequency computation and every frequency-limit comparison to the helpers above —
-/// the same helpers [`super::operator`] calls — so that the compile-time and run-time
-/// views of the clock tree cannot drift apart.
+/// This mirrors the phase ordering of [`super::init()`] exactly, and performs every
+/// frequency computation, frequency-limit comparison, and configuration-derived
+/// register-value mapping. [`super::operator`] consumes the resulting values rather
+/// than repeating these decisions at run time.
 pub(super) const fn resolve(config: &ClocksConfig) -> Result<Clocks, ClockError> {
     match resolve_program(config) {
         Ok(program) => Ok(program.clocks),
