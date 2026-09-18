@@ -1090,6 +1090,10 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         }
 
         spll_program = SpllProgram::Enabled {
+            #[cfg(feature = "defmt")]
+            f_in,
+            #[cfg(feature = "defmt")]
+            fcco,
             source: variant,
             selp: spll_selp(m) as u8,
             seli: spll_seli(m) as u8,

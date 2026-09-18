@@ -70,8 +70,15 @@ pub(super) enum SpllProgram {
     ///
     /// The resulting frequency and power live in
     /// [`ResolvedClockProgram::clocks`], as `pll1_clk` / `pll1_clk_div`. `Fcco` is
-    /// range-checked during resolution and is deliberately not carried here.
+    /// range-checked during resolution and is carried here only when the `defmt`
+    /// feature is enabled, for diagnostics.
     Enabled {
+        /// SPLL input frequency in hertz, retained for `defmt` diagnostics.
+        #[cfg(feature = "defmt")]
+        f_in: u32,
+        /// SPLL CCO output frequency in hertz, retained for `defmt` diagnostics.
+        #[cfg(feature = "defmt")]
+        fcco: u32,
         /// `SPLLCTRL[SOURCE]`.
         source: Source,
         /// `SPLLCTRL[SELP]`.

@@ -521,6 +521,10 @@ impl ClockOperator<'_> {
 
         // No PLL? Nothing to do!
         let SpllProgram::Enabled {
+            #[cfg(feature = "defmt")]
+            f_in,
+            #[cfg(feature = "defmt")]
+            fcco,
             source,
             selp,
             seli,
@@ -554,6 +558,12 @@ impl ClockOperator<'_> {
             defmt::debug!("bp_pre: {:?}", bp_pre);
             defmt::debug!("bp_post: {:?}", bp_post);
             defmt::debug!("bp_post2: {:?}", bp_post2);
+            defmt::debug!("f_in: {:?}", f_in);
+            defmt::debug!(
+                "fout: {:?}",
+                self.resolved.clocks.pll1_clk.as_ref().map(|c| c.frequency)
+            );
+            defmt::debug!("fcco: {:?}", fcco);
             defmt::debug!("m: {:?}", m);
             defmt::debug!("p: {:?}", p);
             defmt::debug!("n: {:?}", n);
