@@ -15,14 +15,14 @@ use super::program::Osc32KProgram;
 #[cfg(not(feature = "sosc-as-gpio"))]
 use super::program::SoscProgram;
 use super::program::{
-    ActiveDrive, ActiveProgram, FircProgram, Fro16KProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram,
-    SircProgram, SpllProgram, VoltageProgram,
+    ActiveDrive, ActiveProgram, FircProgram, Fro16KProgram, LowPowerDrive, LowPowerProgram, MainClockProgram,
+    ResolvedClockProgram, SircProgram, SpllProgram, VoltageProgram,
 };
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
-use crate::chips::ClockLimits;
+use crate::chips::{ClockLimits, clock_limits};
 #[cfg(not(feature = "sosc-as-gpio"))]
 use crate::pac::scg::{Erefs, Range};
-use crate::pac::scg::{Fircsten, Source, Spllsten};
+use crate::pac::scg::{Fircsten, Scs, Source, Spllsten};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -1119,16 +1119,16 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     //
     // Main clock: mirrors `configure_main_clk`.
     //
-    let (name, src) = match config.main_clock.source {
+    let (name, src, scs) = match config.main_clock.source {
         #[cfg(not(feature = "sosc-as-gpio"))]
-        MainClockSource::SoscClkIn => ("clk_in", clocks.clk_in.as_ref()),
-        MainClockSource::SircFro12M => ("fro_12m", clocks.fro_12m.as_ref()),
-        MainClockSource::FircHfRoot => ("fro_hf_root", clocks.fro_hf_root.as_ref()),
+        MainClockSource::SoscClkIn => ("clk_in", clocks.clk_in.as_ref(), Scs::Sosc),
+        MainClockSource::SircFro12M => ("fro_12m", clocks.fro_12m.as_ref(), Scs::Sirc),
+        MainClockSource::FircHfRoot => ("fro_hf_root", clocks.fro_hf_root.as_ref(), Scs::Firc),
         #[cfg(feature = "mcxa2xx")]
-        MainClockSource::RoscFro16K => ("fro16k", clocks.clk_16k_vdd_core.as_ref()),
+        MainClockSource::RoscFro16K => ("fro16k", clocks.clk_16k_vdd_core.as_ref(), Scs::Rosc),
         #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
-        MainClockSource::RoscOsc32K => ("osc32k", clocks.clk_32k_vdd_core.as_ref()),
-        MainClockSource::SPll1 => ("pll1_clk", clocks.pll1_clk.as_ref()),
+        MainClockSource::RoscOsc32K => ("osc32k", clocks.clk_32k_vdd_core.as_ref(), Scs::Rosc),
+        MainClockSource::SPll1 => ("pll1_clk", clocks.pll1_clk.as_ref(), Scs::Spll),
     };
     let Some(main_clk_src) = src else {
         return Err(ClockError::BadConfig {
@@ -1180,6 +1180,34 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         power: main_power,
     });
 
+    // BEFORE we switch, update the flash wait states to the appropriate levels
+    //
+    // NOTE: "cpu_clk" is the same as "system_clk". Table 22 is not clear exactly
+    // WHICH source clock the limits apply to, but system/ahb/cpu is a fair bet.
+    //
+    // TODO: This calculation doesn't consider low power mode yet!
+    let (levels, wsmax) = match active_power {
+        VddLevel::MidDriveMode => (
+            clock_limits::VDD_CORE_MID_DRIVE_WAIT_STATE_LIMITS,
+            clock_limits::VDD_CORE_MID_DRIVE_MAX_WAIT_STATES,
+        ),
+        #[cfg(feature = "mcxa5xx")]
+        VddLevel::NormalMode => (
+            clock_limits::VDD_CORE_NORMAL_DRIVE_WAIT_STATE_LIMITS,
+            clock_limits::VDD_CORE_NORMAL_DRIVE_MAX_WAIT_STATES,
+        ),
+        VddLevel::OverDriveMode => (
+            clock_limits::VDD_CORE_OVER_DRIVE_WAIT_STATE_LIMITS,
+            clock_limits::VDD_CORE_OVER_DRIVE_MAX_WAIT_STATES,
+        ),
+    };
+
+    let main_clock = MainClockProgram {
+        scs,
+        wait_states: flash_wait_states(levels, wsmax, cpu_freq),
+        ahb_div_bits: config.main_clock.ahb_clk_div.into_bits(),
+    };
+
     Ok(ResolvedClockProgram {
         clocks,
         voltage,
@@ -1191,5 +1219,6 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         #[cfg(not(feature = "sosc-as-gpio"))]
         sosc: sosc_program,
         spll: spll_program,
+        main_clock,
     })
 }

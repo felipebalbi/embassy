@@ -14,7 +14,7 @@ use super::config::CoreSleep;
 use super::types::Clocks;
 #[cfg(not(feature = "sosc-as-gpio"))]
 use crate::pac::scg::{Erefs, Range};
-use crate::pac::scg::{Fircsten, FreqSel, Source, Spllsten};
+use crate::pac::scg::{Fircsten, FreqSel, Scs, Source, Spllsten};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -41,6 +41,21 @@ pub(super) struct ResolvedClockProgram {
     pub(super) sosc: SoscProgram,
     /// The values `configure_spll` needs.
     pub(super) spll: SpllProgram,
+    /// The values `configure_main_clk` needs.
+    pub(super) main_clock: MainClockProgram,
+}
+
+/// Everything `configure_main_clk` derives from the configuration.
+pub(super) struct MainClockProgram {
+    /// `SCG0[RCCR.SCS]`, also compared against the live `CSR[SCS]` read-back.
+    pub(super) scs: Scs,
+    /// `FMU0[FCTRL.RWSC]`.
+    pub(super) wait_states: u8,
+    /// `SYSCON[AHBCLKDIV.DIV]`.
+    ///
+    /// NOTE: a value of `0` skips the write entirely, matching the existing
+    /// behaviour.
+    pub(super) ahb_div_bits: u8,
 }
 
 /// Everything `configure_spll` derives from the configuration.

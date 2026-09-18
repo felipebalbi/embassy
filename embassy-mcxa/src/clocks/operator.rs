@@ -3,14 +3,12 @@
 //! This module contains the private `ClockOperator` struct and all of its
 //! `configure_*` methods. It is only used during [`super::init()`].
 
-use config::{ClocksConfig, CoreSleep, MainClockSource, VddLevel};
+use config::CoreSleep;
 use cortex_m::peripheral::SCB;
 
-use super::calc;
 use super::config;
 use super::program::{ActiveDrive, LowPowerDrive, ResolvedClockProgram};
-use super::types::{Clock, ClockError, Clocks, PoweredClock};
-use crate::chips::{ClockLimits, clock_limits};
+use super::types::ClockError;
 use crate::pac;
 use crate::pac::cmc::Ckmode;
 use crate::pac::scg::{
@@ -32,10 +30,6 @@ use crate::pac::syscon::{
 /// `SYSCON`, and `VBAT` should not be allowed for the duration of the [`init()`](super::init) function.
 #[allow(dead_code)]
 pub(super) struct ClockOperator<'a> {
-    /// A mutable reference to the current state of system clocks
-    pub(super) clocks: &'a mut Clocks,
-    /// A reference to the requested configuration provided by the caller of [`init()`](super::init)
-    pub(super) config: &'a ClocksConfig,
     /// The fully-resolved program that this operator applies to hardware
     pub(super) resolved: &'a ResolvedClockProgram,
 
@@ -55,24 +49,6 @@ impl ClockOperator<'_> {
         // MRCC registers re enable/div settings. For now, just leave it unlocked,
         // we might want to actively unlock/lock in periph helpers in the future.
         self.syscon.clkunlock().modify(|w| w.set_unlock(Unlock::Enable));
-    }
-
-    fn active_limits(&self) -> &'static ClockLimits {
-        calc::active_limits(self.config.vdd_power.active_mode.level)
-    }
-
-    #[allow(dead_code)]
-    fn low_power_limits(&self) -> &'static ClockLimits {
-        calc::low_power_limits(self.config.vdd_power.low_power_mode.level)
-    }
-
-    fn lowest_relevant_limits(&self, for_power: &PoweredClock) -> &'static ClockLimits {
-        // We always enforce that deep sleep has a drive <= active mode.
-        calc::lowest_relevant_limits(
-            self.config.vdd_power.active_mode.level,
-            self.config.vdd_power.low_power_mode.level,
-            *for_power,
-        )
     }
 
     /// Configure the FIRC/FRO180M/FRO192M clock family
@@ -150,18 +126,15 @@ impl ClockOperator<'_> {
         }
 
         // Note that the fro_hf_root is active
-        self.clocks.fro_hf_root = self.resolved.clocks.fro_hf_root.clone();
 
         // Okay! Now we're past that, let's enable all the downstream clocks.
         let pow_set = self.resolved.firc.fircsten;
 
         // Do we enable the `fro_hf` output?
         let fro_hf_set = self.resolved.firc.fro_hf_gate;
-        self.clocks.fro_hf = self.resolved.clocks.fro_hf.clone();
 
         // Do we enable the `clk_45m`/`clk_48m` output?
         let clk_fund_set = self.resolved.firc.fundamental_gate;
-        self.clocks.clk_hf_fundamental = self.resolved.clocks.clk_hf_fundamental.clone();
 
         self.scg0.firccsr().modify(|w| {
             w.set_fircsten(pow_set);
@@ -194,7 +167,6 @@ impl ClockOperator<'_> {
             while self.syscon.frohfdiv().read().unstab() == FrohfdivUnstab::Ongoing {}
 
             // Store off the clock info
-            self.clocks.fro_hf_div = self.resolved.clocks.fro_hf_div.clone();
         }
 
         Ok(())
@@ -204,18 +176,15 @@ impl ClockOperator<'_> {
     pub(super) fn configure_sirc_clocks_early(&mut self) -> Result<(), ClockError> {
         // Allow writes
         self.scg0.sirccsr().modify(|w| w.set_lk(SirccsrLk::WriteEnabled));
-        self.clocks.fro_12m_root = self.resolved.clocks.fro_12m_root.clone();
 
         let deep = self.resolved.sirc.deep;
 
         // clk_1m is *before* the fro_12m clock gate
-        self.clocks.clk_1m = self.resolved.clocks.clk_1m.clone();
 
         // If the user wants fro_12m to be disabled, FOR now, we ignore their
         // wish to ensure fro_12m is selectable as a main_clk source at least until
         // we select the CPU clock. We still mark it as not enabled though, to prevent
         // other peripherals using it, as we will gate if off at `configure_sirc_clocks_late`.
-        self.clocks.fro_12m = self.resolved.clocks.fro_12m.clone();
 
         // Set sleep/peripheral usage
         self.scg0.sirccsr().modify(|w| {
@@ -257,7 +226,6 @@ impl ClockOperator<'_> {
             while self.syscon.frolfdiv().read().unstab() == FrolfdivUnstab::Ongoing {}
 
             // Store off the clock info
-            self.clocks.fro_lf_div = self.resolved.clocks.fro_lf_div.clone();
         }
 
         Ok(())
@@ -299,12 +267,8 @@ impl ClockOperator<'_> {
         // Bit 2: clk_16k2 to VBAT domain (5xx only)
         //
         // TODO: Define sub-fields for this register with a PAC patch?
-        self.clocks.clk_16k_vsys = self.resolved.clocks.clk_16k_vsys.clone();
-        self.clocks.clk_16k_vdd_core = self.resolved.clocks.clk_16k_vdd_core.clone();
         #[cfg(feature = "mcxa5xx")]
-        {
-            self.clocks.clk_16k_vbat = self.resolved.clocks.clk_16k_vbat.clone();
-        }
+        {}
         self.vbat0.froclke().modify(|w| w.set_clke(bits));
 
         Ok(())
@@ -392,9 +356,6 @@ impl ClockOperator<'_> {
                 });
 
                 // 5. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
-                self.clocks.clk_32k_vsys = self.resolved.clocks.clk_32k_vsys.clone();
-                self.clocks.clk_32k_vdd_core = self.resolved.clocks.clk_32k_vdd_core.clone();
-                self.clocks.clk_32k_vbat = self.resolved.clocks.clk_32k_vbat.clone();
                 self.vbat0.oscclke().modify(|w| {
                     w.set_clke(clke);
                 });
@@ -459,9 +420,6 @@ impl ClockOperator<'_> {
                 while self.vbat0.statusa().read().osc_rdy() != StatusaOscRdy::Set {}
 
                 // 7. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
-                self.clocks.clk_32k_vsys = self.resolved.clocks.clk_32k_vsys.clone();
-                self.clocks.clk_32k_vdd_core = self.resolved.clocks.clk_32k_vdd_core.clone();
-                self.clocks.clk_32k_vbat = self.resolved.clocks.clk_32k_vbat.clone();
                 self.vbat0.oscclke().modify(|w| {
                     w.set_clke(clke);
                 });
@@ -539,8 +497,6 @@ impl ClockOperator<'_> {
 
         // Re-lock the sosc
         self.scg0.sosccsr().modify(|w| w.set_lk(SosccsrLk::WriteDisabled));
-
-        self.clocks.clk_in = self.resolved.clocks.clk_in.clone();
 
         Ok(())
     }
@@ -666,7 +622,6 @@ impl ClockOperator<'_> {
         self.scg0.spllcsr().modify(|w| w.set_lk(SpllcsrLk::WriteDisabled));
 
         // Store clock state
-        self.clocks.pll1_clk = self.resolved.clocks.pll1_clk.clone();
 
         // Do we enable the `pll1_clk_div` output?
         if let Some(div) = pll1_clk_div_bits {
@@ -693,115 +648,39 @@ impl ClockOperator<'_> {
             while self.syscon.pll1clkdiv().read().unstab() == Pll1clkdivUnstab::Ongoing {}
 
             // Store off the clock info
-            self.clocks.pll1_clk_div = self.resolved.clocks.pll1_clk_div.clone();
         }
 
         Ok(())
     }
 
     pub(super) fn configure_main_clk(&mut self) -> Result<(), ClockError> {
-        let (var, name, clk) = match self.config.main_clock.source {
-            #[cfg(not(feature = "sosc-as-gpio"))]
-            MainClockSource::SoscClkIn => (Scs::Sosc, "clk_in", self.clocks.clk_in.as_ref()),
-            MainClockSource::SircFro12M => (Scs::Sirc, "fro_12m", self.clocks.fro_12m.as_ref()),
-            MainClockSource::FircHfRoot => (Scs::Firc, "fro_hf_root", self.clocks.fro_hf_root.as_ref()),
-            #[cfg(feature = "mcxa2xx")]
-            MainClockSource::RoscFro16K => (Scs::Rosc, "fro16k", self.clocks.clk_16k_vdd_core.as_ref()),
-            #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
-            MainClockSource::RoscOsc32K => (Scs::Rosc, "osc32k", self.clocks.clk_32k_vdd_core.as_ref()),
-            MainClockSource::SPll1 => (Scs::Spll, "pll1_clk", self.clocks.pll1_clk.as_ref()),
-        };
-        let Some(main_clk_src) = clk else {
-            return Err(ClockError::BadConfig {
-                clock: name,
-                reason: "Needed for main_clock but not enabled",
-            });
-        };
-
-        if !main_clk_src.power.meets_requirement_of(&self.config.main_clock.power) {
-            return Err(ClockError::BadConfig {
-                clock: name,
-                reason: "Needed for main_clock but not low power",
-            });
-        }
-
-        let lowest_limits = self.lowest_relevant_limits(&self.config.main_clock.power);
-        let active_limits = self.active_limits();
-
-        let (levels, wsmax) = match self.config.vdd_power.active_mode.level {
-            VddLevel::MidDriveMode => (
-                clock_limits::VDD_CORE_MID_DRIVE_WAIT_STATE_LIMITS,
-                clock_limits::VDD_CORE_MID_DRIVE_MAX_WAIT_STATES,
-            ),
-            #[cfg(feature = "mcxa5xx")]
-            VddLevel::NormalMode => (
-                clock_limits::VDD_CORE_NORMAL_DRIVE_WAIT_STATE_LIMITS,
-                clock_limits::VDD_CORE_NORMAL_DRIVE_MAX_WAIT_STATES,
-            ),
-            VddLevel::OverDriveMode => (
-                clock_limits::VDD_CORE_OVER_DRIVE_WAIT_STATE_LIMITS,
-                clock_limits::VDD_CORE_OVER_DRIVE_MAX_WAIT_STATES,
-            ),
-        };
-
-        // Is the main_clk source in range for main_clk?
-        match calc::validate_max_frequency(
-            main_clk_src.frequency,
-            lowest_limits.main_clk,
-            name,
-            "Exceeds main_clock frequency",
-        ) {
-            Ok(()) => {}
-            Err(e) => return Err(e),
-        }
-
-        // Calculate expected CPU frequency based on main_clk and AHB div
-        let ahb_div = self.config.main_clock.ahb_clk_div;
-        let cpu_freq = calc::divided_frequency(main_clk_src.frequency, ahb_div);
-
-        // Is the expected CPU frequency in range for cpu_clk? Note: the CPU
-        // is never running in deep sleep, so we directly use the active limits here
-        match calc::validate_max_frequency(cpu_freq, active_limits.cpu_clk, name, "Exceeds ahb max frequency") {
-            Ok(()) => {}
-            Err(e) => return Err(e),
-        }
+        // NOTE: source selection, its availability/power checks, and both
+        // frequency-limit checks are performed during resolution, before we get here.
+        let scs = self.resolved.main_clock.scs;
+        let ahb_div_bits = self.resolved.main_clock.ahb_div_bits;
 
         // BEFORE we switch, update the flash wait states to the appropriate levels
-        //
-        // NOTE: "cpu_clk" is the same as "system_clk". Table 22 is not clear exactly
-        // WHICH source clock the limits apply to, but system/ahb/cpu is a fair bet.
-        //
-        // TODO: This calculation doesn't consider low power mode yet!
-        let wait_states = calc::flash_wait_states(levels, wsmax, cpu_freq);
+        let wait_states = self.resolved.main_clock.wait_states;
         self.fmu0.fctrl().modify(|w| w.set_rwsc(wait_states));
 
         // TODO: (Double) check if clock is actually valid before switching?
         // Are we already on the right clock?
         let now = self.scg0.csr().read().scs();
-        if now != var {
+        if now != scs {
             // Set RCCR
-            self.scg0.rccr().modify(|w| w.set_scs(var));
+            self.scg0.rccr().modify(|w| w.set_scs(scs));
 
             // Wait for match
-            while self.scg0.csr().read().scs() != var {}
+            while self.scg0.csr().read().scs() != scs {}
         }
 
-        // The main_clk is now set to the selected input clock
-        self.clocks.main_clk = Some(main_clk_src.clone());
-
         // Update AHB clock division, if necessary
-        if ahb_div.into_bits() != 0 {
+        if ahb_div_bits != 0 {
             // AHB has no halt/reset fields - it's different to other DIV8s!
-            self.syscon.ahbclkdiv().modify(|w| w.set_div(ahb_div.into_bits()));
+            self.syscon.ahbclkdiv().modify(|w| w.set_div(ahb_div_bits));
             // Wait for clock to stabilize
             while self.syscon.ahbclkdiv().read().unstab() == AhbclkdivUnstab::Ongoing {}
         }
-
-        // Store off the clock info
-        self.clocks.cpu_system_clk = Some(Clock {
-            frequency: cpu_freq,
-            power: main_clk_src.power,
-        });
 
         Ok(())
     }
@@ -910,7 +789,6 @@ impl ClockOperator<'_> {
             self.spc0.lp_cfg().modify(|w| w.set_coreldo_vdd_lvl(lvl));
             self.spc0.lp_cfg().modify(|w| w.set_bgmode(LpCfgBgmode::Bgmode0));
         }
-        self.clocks.bandgap_lowpower = self.resolved.clocks.bandgap_lowpower;
 
         // Updating CORELDO_VDD_LVL sets the SC[BUSY] flag. That flag remains set for at least the total time
         // delay that Active Voltage Trim Delay (ACTIVE_VDELAY) specifies.
@@ -940,12 +818,9 @@ impl ClockOperator<'_> {
                 // optionally disable bandgap AFTER setting vdd strength to low
                 self.spc0.active_cfg().modify(|w| w.set_coreldo_vdd_ds(ds));
                 self.spc0.active_cfg().modify(|w| w.set_bgmode(bgmode));
-
-                self.clocks.bandgap_active = self.resolved.clocks.bandgap_active;
             }
             ActiveDrive::Normal => {
                 // Already set to normal above
-                self.clocks.bandgap_active = self.resolved.clocks.bandgap_active;
             }
         }
 
@@ -1000,7 +875,6 @@ impl ClockOperator<'_> {
                 }
             }
         }
-        self.clocks.core_sleep = self.resolved.voltage.core_sleep;
 
         // Allow automatic gating of the flash memory
         let wake = self.resolved.voltage.flash_wake;
@@ -1017,8 +891,6 @@ impl ClockOperator<'_> {
         self.spc0.lp_cfg1().write(|w| w.0 = 0);
 
         // Update status
-        self.clocks.active_power = self.resolved.clocks.active_power;
-        self.clocks.lp_power = self.resolved.clocks.lp_power;
 
         Ok(())
     }

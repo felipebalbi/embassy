@@ -236,10 +236,7 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
     // Everything the operator applies below comes from this result.
     let resolved = calc::resolve_program(&settings)?;
 
-    let mut clocks = Clocks::default();
     let mut operator = operator::ClockOperator {
-        clocks: &mut clocks,
-        config: &settings,
         resolved: &resolved,
 
         _mrcc0: pac::MRCC0,
