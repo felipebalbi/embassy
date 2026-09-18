@@ -1,6 +1,14 @@
-//! Similar to blinky, but clocked with external SOSC
+//! Blinky, but with the clock tree declared via `validated_clocks!`.
 //!
-//! This will probably go away once we have the CLKOUT peripheral supported.
+//! The SPLL is sourced from SIRC and drives `main_clk`. The whole tree is
+//! declared at module scope and resolved and checked at COMPILE time: if the
+//! configuration were not legal, this file would fail to build at the
+//! `validated_clocks!` invocation rather than faulting at runtime.
+//!
+//! The resulting [`ValidatedClocksConfig`] token is handed to
+//! `hal::init_validated()`, so the configuration value that was checked is the
+//! value passed to clock initialisation. That binds the input configuration; it
+//! does not prove the runtime or the hardware reaches the asserted tree.
 
 #![no_std]
 #![no_main]
@@ -9,29 +17,38 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_mcxa as hal;
 use embassy_mcxa::clocks::PoweredClock;
-use embassy_mcxa::clocks::config::{MainClockSource, SpllConfig, SpllMode, SpllSource};
+use embassy_mcxa::clocks::config::{ClocksConfig, MainClockSource, SpllConfig, SpllMode, SpllSource};
 use embassy_time::Timer;
 use hal::gpio::{DriveStrength, Level, Output, SlewRate};
 use panic_probe as _;
 
+hal::validated_clocks! {
+    /// Clock tree for this example: SPLL at 12 MHz, sourced from SIRC, driving `main_clk`.
+    pub mod board_clocks {
+        clock_config: {
+            let mut c = ClocksConfig::new();
+            c.spll = Some(SpllConfig {
+                source: SpllSource::Sirc,
+                // 12MHz
+                // 12 x 32 => 384MHz
+                // 384 / (16 x 2) => 12.0MHz
+                mode: SpllMode::Mode1b {
+                    m_mult: 32,
+                    p_div: 16,
+                    bypass_p2_div: false,
+                },
+                power: PoweredClock::NormalEnabledDeepSleepDisabled,
+                pll1_clk_div: None,
+            });
+            c.main_clock.source = MainClockSource::SPll1;
+            c
+        };
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let mut cfg = hal::config::Config::default();
-    cfg.clock_cfg.spll = Some(SpllConfig {
-        source: SpllSource::Sirc,
-        // 12MHz
-        // 12 x 32 => 384MHz
-        // 384 / (16 x 2) => 12.0MHz
-        mode: SpllMode::Mode1b {
-            m_mult: 32,
-            p_div: 16,
-            bypass_p2_div: false,
-        },
-        power: PoweredClock::NormalEnabledDeepSleepDisabled,
-        pll1_clk_div: None,
-    });
-    cfg.clock_cfg.main_clock.source = MainClockSource::SPll1;
-    let p = hal::init(cfg);
+    let p = hal::init_validated(hal::config::Config::default(), board_clocks::VALIDATED);
 
     defmt::info!("Blink example");
 

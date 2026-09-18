@@ -6,12 +6,42 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_mcxa as hal;
 use embassy_time::Timer;
+use hal::clocks::PoweredClock;
+use hal::clocks::config::ClocksConfig;
+use hal::clocks::periph_helpers::{Div4, FlexspiClockSel};
 use hal::config::Config;
 use hal::flexspi::{ClockConfig as FlexspiClockConfig, Flexspi, NorFlash};
 use panic_probe as _;
 
 #[path = "../flexspi_common.rs"]
 mod flexspi_common;
+
+hal::validated_clocks! {
+    /// Clock tree for this example (the chip defaults), plus the FlexSPI
+    /// peripheral clock. Both the tree and the FlexSPI clock settings are
+    /// resolved and asserted at COMPILE time. Passing `FLEXSPI_CLOCK` below to
+    /// the driver is a convention, not an enforcement: nothing detects it if you
+    /// assert one value here and hand the driver another.
+    ///
+    /// NOTE: this file imports `defmt::panic`, which shadows the prelude
+    /// `panic!` inside the module this macro generates (it does `use super::*;`).
+    /// Hence the explicit `core::panic!` below.
+    pub mod board_clocks {
+        clock_config: ClocksConfig::new();
+        peripherals: {
+            /// Clock settings for the on-board QSPI flash: `fro_hf` / 4.
+            pub const FLEXSPI_CLOCK: FlexspiClockConfig = FlexspiClockConfig {
+                power: PoweredClock::NormalEnabledDeepSleepDisabled,
+                source: FlexspiClockSel::FroHf,
+                div: match Div4::from_divisor(4) {
+                    Some(v) => v,
+                    None => core::panic!("divisor out of range"),
+                },
+            };
+            validate: FlexspiClockConfig::validate_clock;
+        }
+    }
+}
 
 use flexspi_common::{
     FLASH_CONFIG, FLASH_PAGE_SIZE, FLASH_SECTOR_SIZE, READ_LEN_PROBES, SELF_TEST_BYTES, SELF_TEST_PAGES,
@@ -22,7 +52,7 @@ const FLASH_BASE: u32 = (1000 * 0x1000) as u32;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = hal::init(Config::default());
+    let p = hal::init_validated(Config::default(), board_clocks::VALIDATED);
 
     info!("FlexSPI blocking self-test");
 
@@ -35,7 +65,7 @@ async fn main(_spawner: Spawner) {
         p.P3_9,
         p.P3_10,
         p.P3_11,
-        FlexspiClockConfig::default(),
+        board_clocks::FLEXSPI_CLOCK,
         FLASH_CONFIG,
     ));
 
