@@ -7,6 +7,10 @@
 //!
 //! See the docs of [`SPConfHelper`] for more details.
 
+use super::config::{
+    ClocksConfig, CoreSleep, Div8, FircConfig, FircFreqSel, FlashSleep, Fro16KConfig, MainClockConfig, MainClockSource,
+    SircConfig, SpllConfig, SpllMode, SpllSource, VddDriveStrength, VddModeConfig, VddPowerConfig,
+};
 use super::{ClockError, Clocks, PoweredClock, WakeGuard};
 use crate::clocks::VddLevel;
 #[cfg(feature = "mcxa5xx")]
@@ -2003,86 +2007,206 @@ const fn div4(n: u8) -> Div4 {
     }
 }
 
-/// A clock that stops in deep sleep.
-const fn hp_clock(frequency: u32) -> Option<crate::clocks::Clock> {
-    Some(crate::clocks::Clock {
-        frequency,
-        power: PoweredClock::NormalEnabledDeepSleepDisabled,
-    })
-}
-
-/// A clock that keeps running in deep sleep.
-const fn lp_clock(frequency: u32) -> Option<crate::clocks::Clock> {
-    Some(crate::clocks::Clock {
-        frequency,
-        power: PoweredClock::AlwaysEnabled,
-    })
-}
-
-/// Free-running frequency of the high frequency FRO: `FRO180M` on 2xx,
-/// `FRO192M` on 5xx.
-#[cfg(feature = "mcxa2xx")]
-const FIXTURE_FRO_HF_HZ: u32 = 180_000_000;
-#[cfg(feature = "mcxa5xx")]
-const FIXTURE_FRO_HF_HZ: u32 = 192_000_000;
-
-/// `clk_45m` on 2xx, `clk_48m` on 5xx.
-#[cfg(feature = "mcxa2xx")]
-const FIXTURE_CLK_HF_FUNDAMENTAL_HZ: u32 = 45_000_000;
-#[cfg(feature = "mcxa5xx")]
-const FIXTURE_CLK_HF_FUNDAMENTAL_HZ: u32 = 48_000_000;
-
-/// A plausible, fully-populated system clock tree, used only as the fixture for
-/// the compile-time assertions below.
+/// A realistic "mid drive" system configuration: the whole chip stays at 1.0V
+/// in both active and deep sleep, so every clock below is deep-sleep capable.
 ///
-/// `Clocks::default()` is not a `const fn`, so every field is spelled out.
-const VALIDATION_CLOCKS: Clocks = Clocks {
-    active_power: VddLevel::OverDriveMode,
-    lp_power: VddLevel::MidDriveMode,
-    bandgap_active: true,
-    bandgap_lowpower: false,
-    core_sleep: super::config::CoreSleep::WfeUngated,
-
+/// This is a genuine [`ClocksConfig`] - the same type an application hands to
+/// [`init()`](super::init) - and it is deliberately chosen so that the resolved
+/// clock tree lands ON the mid-drive ceilings rather than comfortably below
+/// them: `fro_hf` is exactly `ClockLimits::MID_DRIVE.fro_hf` (90/96 MHz),
+/// `fro_hf_div` is exactly `fro_hf_div` (45/48 MHz), `main_clk` is exactly
+/// `main_clk`, and the CPU is exactly `cpu_clk`.
+const MID_VALIDATION_CONFIG: ClocksConfig = ClocksConfig {
+    vdd_power: VddPowerConfig {
+        active_mode: VddModeConfig {
+            level: VddLevel::MidDriveMode,
+            drive: VddDriveStrength::Normal,
+        },
+        low_power_mode: VddModeConfig {
+            level: VddLevel::MidDriveMode,
+            drive: VddDriveStrength::Normal,
+        },
+        core_sleep: CoreSleep::WfeUngated,
+        flash_sleep: FlashSleep::Never,
+    },
+    main_clock: MainClockConfig {
+        source: MainClockSource::FircHfRoot,
+        power: PoweredClock::NormalEnabledDeepSleepDisabled,
+        ahb_clk_div: Div8::from_raw(1),
+    },
+    firc: Some(FircConfig {
+        #[cfg(feature = "mcxa2xx")]
+        frequency: FircFreqSel::Mhz90,
+        #[cfg(feature = "mcxa5xx")]
+        frequency: FircFreqSel::Mhz96,
+        power: PoweredClock::AlwaysEnabled,
+        fro_hf_enabled: true,
+        clk_hf_fundamental_enabled: true,
+        fro_hf_div: Some(Div8::from_raw(1)),
+    }),
+    sirc: SircConfig {
+        power: PoweredClock::AlwaysEnabled,
+        fro_12m_enabled: true,
+        fro_lf_div: Some(Div8::no_div()),
+    },
+    fro16k: Some(Fro16KConfig {
+        vsys_domain_active: true,
+        vdd_core_domain_active: true,
+        #[cfg(feature = "mcxa5xx")]
+        vbat_domain_active: true,
+    }),
+    #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+    osc32k: None,
     #[cfg(not(feature = "sosc-as-gpio"))]
-    clk_in: hp_clock(24_000_000),
-
-    fro_hf_root: hp_clock(FIXTURE_FRO_HF_HZ),
-    fro_hf: hp_clock(FIXTURE_FRO_HF_HZ),
-    clk_hf_fundamental: hp_clock(FIXTURE_CLK_HF_FUNDAMENTAL_HZ),
-    fro_hf_div: hp_clock(FIXTURE_FRO_HF_HZ / 4),
-
-    fro_12m_root: lp_clock(12_000_000),
-    fro_12m: lp_clock(12_000_000),
-    clk_1m: lp_clock(1_000_000),
-    fro_lf_div: lp_clock(12_000_000),
-
-    clk_16k_vsys: lp_clock(16_000),
-    clk_16k_vdd_core: lp_clock(16_000),
-    #[cfg(feature = "mcxa5xx")]
-    clk_16k_vbat: lp_clock(16_000),
-
-    #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
-    clk_32k_vsys: lp_clock(32_768),
-    #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
-    clk_32k_vdd_core: lp_clock(32_768),
-    #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
-    clk_32k_vbat: lp_clock(32_768),
-
-    main_clk: hp_clock(FIXTURE_FRO_HF_HZ),
-    cpu_system_clk: hp_clock(FIXTURE_FRO_HF_HZ / 2),
-
-    pll1_clk: hp_clock(80_000_000),
-    pll1_clk_div: hp_clock(40_000_000),
+    sosc: None,
+    spll: Some(SpllConfig {
+        source: SpllSource::Sirc,
+        #[cfg(feature = "mcxa2xx")]
+        mode: SpllMode::Mode1b {
+            m_mult: 30,
+            p_div: 4,
+            bypass_p2_div: false,
+        },
+        #[cfg(feature = "mcxa5xx")]
+        mode: SpllMode::Mode1b {
+            m_mult: 32,
+            p_div: 2,
+            bypass_p2_div: false,
+        },
+        power: PoweredClock::AlwaysEnabled,
+        pll1_clk_div: Some(Div8::no_div()),
+    }),
 };
 
-/// Compile-time proof that a spread of realistic peripheral clock
-/// configurations pass `validate` against [`VALIDATION_CLOCKS`].
+/// A realistic "go fast" system configuration: the highest VDD level each chip
+/// family currently supports in active mode, dropping to mid drive (with a low
+/// drive strength, bandgap still on) in deep sleep.
 ///
-/// If a future change to a `validate` body, a frequency limit, or a clock
-/// helper makes one of these configurations invalid, THE BUILD WILL FAIL with
-/// `error[E0080]` quoting the `reason` string from the rejecting check.
+/// Like [`MID_VALIDATION_CONFIG`] this is a genuine [`ClocksConfig`], chosen so
+/// the resolved tree sits right on the ceiling: on 2xx the PLL lands exactly on
+/// `ClockLimits::OVER_DRIVE.cpu_clk` (180 MHz) and `fro_hf` exactly on
+/// `OVER_DRIVE.fro_hf`; on 5xx `fro_hf`/`fro_hf_div` land exactly on
+/// `NORMAL_DRIVE.fro_hf` (192 MHz) and the PLL exactly on `2 x cpu_clk`
+/// (240 MHz), which is also exactly the FlexSPI normal-mode fmax.
+const PERFORMANCE_VALIDATION_CONFIG: ClocksConfig = ClocksConfig {
+    vdd_power: VddPowerConfig {
+        active_mode: VddModeConfig {
+            #[cfg(feature = "mcxa2xx")]
+            level: VddLevel::OverDriveMode,
+            #[cfg(feature = "mcxa5xx")]
+            level: VddLevel::NormalMode,
+            drive: VddDriveStrength::Normal,
+        },
+        low_power_mode: VddModeConfig {
+            level: VddLevel::MidDriveMode,
+            drive: VddDriveStrength::Low { enable_bandgap: true },
+        },
+        core_sleep: CoreSleep::WfeUngated,
+        flash_sleep: FlashSleep::Never,
+    },
+    main_clock: MainClockConfig {
+        #[cfg(feature = "mcxa2xx")]
+        source: MainClockSource::SPll1,
+        #[cfg(feature = "mcxa5xx")]
+        source: MainClockSource::SircFro12M,
+        power: PoweredClock::NormalEnabledDeepSleepDisabled,
+        ahb_clk_div: Div8::no_div(),
+    },
+    firc: Some(FircConfig {
+        #[cfg(feature = "mcxa2xx")]
+        frequency: FircFreqSel::Mhz180,
+        #[cfg(feature = "mcxa5xx")]
+        frequency: FircFreqSel::Mhz192,
+        power: PoweredClock::NormalEnabledDeepSleepDisabled,
+        fro_hf_enabled: true,
+        clk_hf_fundamental_enabled: true,
+        #[cfg(feature = "mcxa2xx")]
+        fro_hf_div: Some(Div8::from_raw(2)),
+        #[cfg(feature = "mcxa5xx")]
+        fro_hf_div: Some(Div8::no_div()),
+    }),
+    sirc: SircConfig {
+        power: PoweredClock::AlwaysEnabled,
+        fro_12m_enabled: true,
+        fro_lf_div: Some(Div8::no_div()),
+    },
+    fro16k: Some(Fro16KConfig {
+        vsys_domain_active: true,
+        vdd_core_domain_active: true,
+        #[cfg(feature = "mcxa5xx")]
+        vbat_domain_active: true,
+    }),
+    #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+    osc32k: None,
+    #[cfg(not(feature = "sosc-as-gpio"))]
+    sosc: None,
+    spll: Some(SpllConfig {
+        source: SpllSource::Sirc,
+        #[cfg(feature = "mcxa2xx")]
+        mode: SpllMode::Mode1b {
+            m_mult: 30,
+            p_div: 2,
+            bypass_p2_div: true,
+        },
+        #[cfg(feature = "mcxa5xx")]
+        mode: SpllMode::Mode1b {
+            m_mult: 40,
+            p_div: 2,
+            bypass_p2_div: true,
+        },
+        power: PoweredClock::NormalEnabledDeepSleepDisabled,
+        #[cfg(feature = "mcxa2xx")]
+        pll1_clk_div: Some(Div8::no_div()),
+        #[cfg(feature = "mcxa5xx")]
+        pll1_clk_div: Some(Div8::from_raw(1)),
+    }),
+};
+
+/// [`MID_VALIDATION_CONFIG`], resolved through the real
+/// [`ClocksConfig::resolve()`] at compile time.
+///
+/// If the resolver, a clock-tree limit, or the arithmetic in `clocks::calc`
+/// regresses such that this configuration is no longer legal, THE BUILD WILL
+/// FAIL here with `error[E0080]` quoting the `reason` string.
+const MID_VALIDATION_CLOCKS: Clocks = match MID_VALIDATION_CONFIG.resolve() {
+    Ok(clocks) => clocks,
+    Err(ClockError::BadConfig { reason, .. }) => panic!("{}", reason),
+    Err(_) => panic!("mid validation clock resolution failed"),
+};
+
+/// [`PERFORMANCE_VALIDATION_CONFIG`], resolved through the real
+/// [`ClocksConfig::resolve()`] at compile time.
+///
+/// See [`MID_VALIDATION_CLOCKS`] for what a failure here means.
+const PERFORMANCE_VALIDATION_CLOCKS: Clocks = match PERFORMANCE_VALIDATION_CONFIG.resolve() {
+    Ok(clocks) => clocks,
+    Err(ClockError::BadConfig { reason, .. }) => panic!("{}", reason),
+    Err(_) => panic!("performance validation clock resolution failed"),
+};
+
+//
+// The assertions themselves.
+//
+// Unlike a hand-written `Clocks` fixture, every frequency below is produced by
+// resolving a REAL [`ClocksConfig`] through [`ClocksConfig::resolve()`] - the
+// same code path `init()` takes - and is then checked by the exact same
+// inherent `validate` that `gate::enable()` calls at run time.
+//
+// Each configuration is deliberately picked to sit AT or just under its fmax,
+// so these blocks act as limit-regression canaries rather than as a smoke test.
+// Every assertion is annotated with its computed source frequency, the fmax
+// that applies at the configured VDD level, and the comparison `validate`
+// actually performs (`freq <= fmax * div`), so the remaining headroom is
+// auditable straight from this source.
+//
+// If a frequency limit, a `validate` body, or the resolver changes, THE BUILD
+// WILL FAIL with `error[E0080]` quoting the rejecting check's `reason` string.
+//
+
+/// Compile-time proof that a spread of near-limit peripheral configurations
+/// pass `validate` against [`MID_VALIDATION_CLOCKS`].
 const _: () = {
-    let clocks = &VALIDATION_CLOCKS;
+    let clocks = &MID_VALIDATION_CLOCKS;
 
     // Placeholder helpers.
     assert_valid(NoConfig.validate(clocks));
@@ -2090,30 +2214,20 @@ const _: () = {
     // NOTE: `UnimplementedConfig` is deliberately NOT asserted here - failing
     // validation is its entire contract.
 
-    // DAC: 12 MHz from `fro_lf_div`, well under every fmax.
+    // DAC: fro_hf_div is 45/48 MHz, fmax (mid drive) is 24 MHz, div is 2.
+    // 2xx: 45 <= 24 x 2 = 48 (93.75%). 5xx: 48 <= 48 (100%).
     assert_valid(
         DacConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: DacClockSel::FroLfDiv,
-            div: Div4::no_div(),
-            instance: DacInstance::Dac0,
-        }
-        .validate(clocks),
-    );
-    // DAC: the disabled source short-circuits to `Ok(0)`.
-    assert_valid(
-        DacConfig {
-            power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: DacClockSel::None,
-            div: Div4::no_div(),
+            source: DacClockSel::FroHfDiv,
+            div: div4(2),
             instance: DacInstance::Dac0,
         }
         .validate(clocks),
     );
 
-    // ADC: the raw `fro_hf` (180/192 MHz) is only legal because the /4
-    // pre-divider brings it under the 64 MHz limit. This exercises the divider
-    // arm of the limit check.
+    // ADC: fro_hf is 90/96 MHz, fmax (mid drive) is 24 MHz, div is 4.
+    // 2xx: 90 <= 24 x 4 = 96 (93.75%). 5xx: 96 <= 96 (100%).
     assert_valid(
         AdcConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
@@ -2122,34 +2236,9 @@ const _: () = {
         }
         .validate(clocks),
     );
-    // ADC: 1 MHz, kept alive through deep sleep. This exercises the
-    // `lp_power` (mid-drive) arm of the limit check.
-    assert_valid(
-        AdcConfig {
-            power: PoweredClock::AlwaysEnabled,
-            source: AdcClockSel::Clk1M,
-            div: Div4::no_div(),
-        }
-        .validate(clocks),
-    );
 
-    // OSTimer: both selectable sources are deep-sleep capable.
-    assert_valid(
-        OsTimerConfig {
-            power: PoweredClock::AlwaysEnabled,
-            source: OstimerClockSel::Clk1M,
-        }
-        .validate(clocks),
-    );
-    assert_valid(
-        OsTimerConfig {
-            power: PoweredClock::AlwaysEnabled,
-            source: OstimerClockSel::Clk16kVddCore,
-        }
-        .validate(clocks),
-    );
-
-    // LPSPI: 45/48 MHz from `fro_hf_div`.
+    // LPSPI: fro_hf_div is 45/48 MHz, fmax (mid drive) is 50 MHz, div is 1.
+    // 2xx: 45 <= 50 (90%). 5xx: 48 <= 50 (96%).
     assert_valid(
         LpspiConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
@@ -2159,18 +2248,9 @@ const _: () = {
         }
         .validate(clocks),
     );
-    // LPSPI: 40 MHz from `pll1_clk_div`.
-    assert_valid(
-        LpspiConfig {
-            power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: LpspiClockSel::Pll1ClkDiv,
-            div: Div4::no_div(),
-            instance: LpspiInstance::Lpspi1,
-        }
-        .validate(clocks),
-    );
 
-    // FlexSPI is 5xx-only.
+    // FlexSPI is 5xx-only: fro_hf is 96 MHz, fmax (mid drive) is 96 MHz, div is
+    // 1. 96 <= 96 (100%).
     #[cfg(feature = "mcxa5xx")]
     assert_valid(
         FlexspiConfig {
@@ -2181,6 +2261,178 @@ const _: () = {
         }
         .validate(clocks),
     );
+
+    // I3C (2xx): fro_hf_div is 45 MHz, fmax is always 25 MHz, div is 2.
+    // 45 <= 25 x 2 = 50 (90%). NOTE: 2xx has no `Pll1ClkDiv` I3C mux option.
+    #[cfg(feature = "mcxa2xx")]
+    assert_valid(
+        I3cConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: I3cClockSel::FroHfDiv,
+            div: div4(2),
+            instance: I3cInstance::I3c0,
+        }
+        .validate(clocks),
+    );
+    // I3C (5xx): pll1_clk_div is 96 MHz, fmax is always 100 MHz, div is 1.
+    // 96 <= 100 (96%).
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(
+        I3cConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: I3cClockSel::Pll1ClkDiv,
+            div: Div4::no_div(),
+            instance: I3cInstance::I3c0,
+        }
+        .validate(clocks),
+    );
+
+    // LPI2C: fro_hf_div is 45/48 MHz, fmax (mid drive) is 25 MHz, div is 2.
+    // 2xx: 45 <= 50 (90%). 5xx: 48 <= 50 (96%).
+    assert_valid(
+        Lpi2cConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: Lpi2cClockSel::FroHfDiv,
+            div: div4(2),
+            instance: Lpi2cInstance::Lpi2c0,
+        }
+        .validate(clocks),
+    );
+
+    // LPUART: fro_hf_div is 45/48 MHz, div is 1.
+    // 2xx: fmax 45 MHz, 45 <= 45 (100%). 5xx: fmax 50 MHz, 48 <= 50 (96%).
+    assert_valid(
+        LpuartConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: LpuartClockSel::FroHfDiv,
+            div: Div4::no_div(),
+            instance: LpuartInstance::Lpuart0,
+        }
+        .validate(clocks),
+    );
+
+    // CTimer (2xx): pll1_clk_div is 45 MHz, fmax (mid drive) is 90 MHz, div is
+    // 1. 45 <= 90 - only 50% of the limit, and that is DELIBERATE, not an
+    // oversight: under 2xx mid drive EVERY source CTimer can select is itself
+    // capped at <= 48 MHz (fro_hf_div <= 45 MHz, pll1_clk_div <= 48 MHz,
+    // fro_lf_div <= 12 MHz, clk_1m, clk_16k), while the CTimer ceiling is
+    // 90 MHz. The limit is therefore UNREACHABLE with any legal configuration.
+    // Do not "fix" this row by inventing an illegal clock tree.
+    #[cfg(feature = "mcxa2xx")]
+    assert_valid(
+        CTimerConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: CTimerClockSel::Pll1ClkDiv,
+            div: Div4::no_div(),
+            instance: CTimerInstance::CTimer0,
+        }
+        .validate(clocks),
+    );
+    // CTimer (5xx): fro_hf_div is 48 MHz, fmax (mid drive) is 50 MHz, div is 1.
+    // 48 <= 50 (96%).
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(
+        CTimerConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: CTimerClockSel::FroHfDiv,
+            div: Div4::no_div(),
+            instance: CTimerInstance::CTimer0,
+        }
+        .validate(clocks),
+    );
+
+    // FlexCAN: fro_hf is 90/96 MHz, div is 2.
+    // 2xx: fmax 45 MHz, 90 <= 90 (100%). 5xx: fmax 50 MHz, 96 <= 100 (96%).
+    assert_valid(
+        CanConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: CanClockSel::FroHf,
+            div: div4(2),
+            instance: CanInstance::Can0,
+        }
+        .validate(clocks),
+    );
+
+    // OSTimer: availability only - both selectable sources are fixed at or
+    // below the 1 MHz peripheral limit, so there is no frequency to compare.
+    // This asserts that `clk_1m` survives deep sleep in this configuration.
+    assert_valid(
+        OsTimerConfig {
+            power: PoweredClock::AlwaysEnabled,
+            source: OstimerClockSel::Clk1M,
+        }
+        .validate(clocks),
+    );
+};
+
+/// Compile-time proof that a spread of near-limit peripheral configurations
+/// pass `validate` against [`PERFORMANCE_VALIDATION_CLOCKS`].
+const _: () = {
+    let clocks = &PERFORMANCE_VALIDATION_CLOCKS;
+
+    // DAC (2xx): fro_hf_div is 60 MHz, fmax (over drive) is 60 MHz, div is 1.
+    // 60 <= 60 (100%).
+    #[cfg(feature = "mcxa2xx")]
+    assert_valid(
+        DacConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: DacClockSel::FroHfDiv,
+            div: Div4::no_div(),
+            instance: DacInstance::Dac0,
+        }
+        .validate(clocks),
+    );
+    // DAC (5xx): fro_hf_div is 192 MHz, fmax (normal drive) is 64 MHz, div is
+    // 3. 192 <= 64 x 3 = 192 (100%).
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(
+        DacConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: DacClockSel::FroHfDiv,
+            div: div4(3),
+            instance: DacInstance::Dac0,
+        }
+        .validate(clocks),
+    );
+
+    // ADC: fro_hf is 180/192 MHz, fmax is 64 MHz on both, div is 3.
+    // 2xx: 180 <= 64 x 3 = 192 (93.75%). 5xx: 192 <= 192 (100%).
+    assert_valid(
+        AdcConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: AdcClockSel::FroHf,
+            div: div4(3),
+        }
+        .validate(clocks),
+    );
+
+    // LPSPI (2xx): pll1_clk_div is 180 MHz, fmax (over drive) is 100 MHz, div
+    // is 2. 180 <= 200 (90%).
+    #[cfg(feature = "mcxa2xx")]
+    assert_valid(
+        LpspiConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: LpspiClockSel::Pll1ClkDiv,
+            div: div4(2),
+            instance: LpspiInstance::Lpspi0,
+        }
+        .validate(clocks),
+    );
+    // LPSPI (5xx): pll1_clk_div is 120 MHz, fmax (normal drive) is 150 MHz, div
+    // is 1. 120 <= 150 (80%).
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(
+        LpspiConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: LpspiClockSel::Pll1ClkDiv,
+            div: Div4::no_div(),
+            instance: LpspiInstance::Lpspi0,
+        }
+        .validate(clocks),
+    );
+
+    // FlexSPI is 5xx-only: pll1_clk is 240 MHz, fmax (normal drive) is 240 MHz,
+    // div is 1. 240 <= 240 (100%).
     #[cfg(feature = "mcxa5xx")]
     assert_valid(
         FlexspiConfig {
@@ -2192,18 +2444,34 @@ const _: () = {
         .validate(clocks),
     );
 
-    // I3C: 2xx caps the FCLK at 25 MHz, so use the 12 MHz `fro_lf_div`.
+    // I3C (2xx): fro_hf_div is 60 MHz, fmax is always 25 MHz, div is 3.
+    // 60 <= 25 x 3 = 75 (80%).
+    #[cfg(feature = "mcxa2xx")]
     assert_valid(
         I3cConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: I3cClockSel::FroLfDiv,
-            div: Div4::no_div(),
+            source: I3cClockSel::FroHfDiv,
+            div: div4(3),
+            instance: I3cInstance::I3c0,
+        }
+        .validate(clocks),
+    );
+    // I3C (5xx): fro_hf_div is 192 MHz, fmax is always 100 MHz, div is 2.
+    // 192 <= 200 (96%).
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(
+        I3cConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: I3cClockSel::FroHfDiv,
+            div: div4(2),
             instance: I3cInstance::I3c0,
         }
         .validate(clocks),
     );
 
-    // LPI2C: 45/48 MHz from `fro_hf_div`, under the 60/64 MHz overdrive limit.
+    // LPI2C (2xx): fro_hf_div is 60 MHz, fmax (over drive) is 60 MHz, div is 1.
+    // 60 <= 60 (100%).
+    #[cfg(feature = "mcxa2xx")]
     assert_valid(
         Lpi2cConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
@@ -2213,56 +2481,66 @@ const _: () = {
         }
         .validate(clocks),
     );
-
-    // LPUART: 45/48 MHz from `fro_hf_div`.
+    // LPI2C (5xx): fro_hf_div is 192 MHz, fmax (normal drive) is 64 MHz, div is
+    // 3. 192 <= 64 x 3 = 192 (100%).
+    #[cfg(feature = "mcxa5xx")]
     assert_valid(
-        LpuartConfig {
+        Lpi2cConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: LpuartClockSel::FroHfDiv,
-            div: Div4::no_div(),
-            instance: LpuartInstance::Lpuart0,
+            source: Lpi2cClockSel::FroHfDiv,
+            div: div4(3),
+            instance: Lpi2cInstance::Lpi2c0,
         }
         .validate(clocks),
     );
-    // LPUART: 40 MHz from `pll1_clk_div`.
+
+    // LPUART: pll1_clk_div is 180/120 MHz, div is 1.
+    // 2xx: fmax 180 MHz, 180 <= 180 (100%).
+    // 5xx: fmax 150 MHz, 120 <= 150 (80%).
     assert_valid(
         LpuartConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
             source: LpuartClockSel::Pll1ClkDiv,
             div: Div4::no_div(),
-            instance: LpuartInstance::Lpuart1,
+            instance: LpuartInstance::Lpuart0,
         }
         .validate(clocks),
     );
 
-    // CTimer: 45/48 MHz from `fro_hf_div`.
+    // CTimer: pll1_clk_div is 180/120 MHz, div is 1.
+    // 2xx: fmax 180 MHz, 180 <= 180 (100%).
+    // 5xx: fmax 150 MHz, 120 <= 150 (80%).
     assert_valid(
         CTimerConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: CTimerClockSel::FroHfDiv,
+            source: CTimerClockSel::Pll1ClkDiv,
             div: Div4::no_div(),
             instance: CTimerInstance::CTimer0,
         }
         .validate(clocks),
     );
 
-    // FlexCAN: 45/48 MHz from `fro_hf_div`, and the undivided 80 MHz `pll1_clk`
-    // which is under the 90/100 MHz overdrive limit.
-    assert_valid(
-        CanConfig {
-            power: PoweredClock::NormalEnabledDeepSleepDisabled,
-            source: CanClockSel::FroHfDiv,
-            div: Div4::no_div(),
-            instance: CanInstance::Can0,
-        }
-        .validate(clocks),
-    );
+    // FlexCAN (2xx): pll1_clk is 180 MHz, fmax (over drive) is 90 MHz, div is
+    // 2. 180 <= 180 (100%).
+    #[cfg(feature = "mcxa2xx")]
     assert_valid(
         CanConfig {
             power: PoweredClock::NormalEnabledDeepSleepDisabled,
             source: CanClockSel::Pll1Clk,
-            div: Div4::no_div(),
-            instance: CanInstance::Can1,
+            div: div4(2),
+            instance: CanInstance::Can0,
+        }
+        .validate(clocks),
+    );
+    // FlexCAN (5xx): fro_hf is 192 MHz, fmax (normal drive) is 100 MHz, div is
+    // 2. 192 <= 200 (96%).
+    #[cfg(feature = "mcxa5xx")]
+    assert_valid(
+        CanConfig {
+            power: PoweredClock::NormalEnabledDeepSleepDisabled,
+            source: CanClockSel::FroHf,
+            div: div4(2),
+            instance: CanInstance::Can0,
         }
         .validate(clocks),
     );
