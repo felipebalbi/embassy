@@ -6,13 +6,15 @@
 //! be evaluated at compile time.
 
 use super::config::{
-    ClocksConfig, Div8, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
+    ClocksConfig, Div8, FircFreqSel, FlashSleep, MainClockSource, SpllMode, SpllSource, VddDriveStrength, VddLevel,
 };
 use super::program::{
-    ActiveDrive, ActiveProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram, SircProgram, VoltageProgram,
+    ActiveDrive, ActiveProgram, FircProgram, LowPowerDrive, LowPowerProgram, ResolvedClockProgram, SircProgram,
+    VoltageProgram,
 };
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::ClockLimits;
+use crate::pac::scg::Fircsten;
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -582,9 +584,36 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
     //
     // FIRC: mirrors `configure_firc_clocks`.
     //
+    // NOTE: when no FIRC configuration was requested, `is_default` stays `false`,
+    // which is what drives the RCCR -> SIRC detour in `configure_firc_clocks`.
+    let mut firc_program = FircProgram {
+        enabled: false,
+        is_default: false,
+        freq_sel: None,
+        fircsten: Fircsten::DisabledInStopModes,
+        fro_hf_gate: false,
+        fundamental_gate: false,
+        fro_hf_div_bits: None,
+    };
     if let Some(firc) = config.firc.as_ref() {
-        let (base_freq, _sel) = firc.frequency.to_freq_and_sel();
+        let (base_freq, sel) = firc.frequency.to_freq_and_sel();
         let limits = lowest_relevant_limits(active_power, lp_power, firc.power);
+
+        firc_program.enabled = true;
+        firc_program.freq_sel = Some(sel);
+        // NOTE: `PartialEq::eq` is not callable in const context, so the chip
+        // family's reset-default frequency is matched structurally instead.
+        firc_program.is_default = match firc.frequency {
+            #[cfg(feature = "mcxa2xx")]
+            FircFreqSel::Mhz45 => true,
+            #[cfg(feature = "mcxa5xx")]
+            FircFreqSel::Mhz48 => true,
+            _ => false,
+        };
+        firc_program.fircsten = match firc.power {
+            PoweredClock::NormalEnabledDeepSleepDisabled => Fircsten::DisabledInStopModes,
+            PoweredClock::AlwaysEnabled => Fircsten::EnabledInStopModes,
+        };
 
         clocks.fro_hf_root = Some(Clock {
             frequency: base_freq,
@@ -607,6 +636,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 frequency: base_freq,
                 power: firc.power,
             });
+            firc_program.fro_hf_gate = true;
         }
 
         if firc.clk_hf_fundamental_enabled {
@@ -614,6 +644,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 frequency: CLK_HF_FUNDAMENTAL_FREQUENCY,
                 power: firc.power,
             });
+            firc_program.fundamental_gate = true;
         }
 
         if let Some(d) = firc.fro_hf_div.as_ref() {
@@ -633,6 +664,7 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
                 frequency: div_freq,
                 power: firc.power,
             });
+            firc_program.fro_hf_div_bits = Some(d.into_bits());
         }
     }
 
@@ -959,5 +991,10 @@ pub(super) const fn resolve_program(config: &ClocksConfig) -> Result<ResolvedClo
         power: main_power,
     });
 
-    Ok(ResolvedClockProgram { clocks, voltage, sirc })
+    Ok(ResolvedClockProgram {
+        clocks,
+        voltage,
+        sirc,
+        firc: firc_program,
+    })
 }

@@ -3,7 +3,7 @@
 //! This module contains the private `ClockOperator` struct and all of its
 //! `configure_*` methods. It is only used during [`super::init()`].
 
-use config::{ClocksConfig, CoreSleep, FircConfig, FircFreqSel, Fro16KConfig, MainClockSource, VddLevel};
+use config::{ClocksConfig, CoreSleep, Fro16KConfig, MainClockSource, VddLevel};
 use cortex_m::peripheral::SCB;
 
 use super::calc;
@@ -85,11 +85,7 @@ impl ClockOperator<'_> {
         //   * Make FIRC changes
         //   * Switch main clock back to FIRC
         // * Firc is enabled and default -> nop
-        #[cfg(feature = "mcxa2xx")]
-        let default_freq = FircFreqSel::Mhz45;
-        #[cfg(feature = "mcxa5xx")]
-        let default_freq = FircFreqSel::Mhz48;
-        let is_default = self.config.firc.as_ref().is_some_and(|c| c.frequency == default_freq);
+        let is_default = self.resolved.firc.is_default;
 
         // If we are not default, then we need to switch to SIRC
         if !is_default {
@@ -104,18 +100,23 @@ impl ClockOperator<'_> {
         self.scg0.firccsr().modify(|w| w.set_lk(FirccsrLk::WriteEnabled));
 
         // Did the user give us a FIRC config?
-        let Some(firc) = self.config.firc.as_ref() else {
-            // Nope, and we've already switched to fro_12m. Disable FIRC.
-            self.scg0.firccsr().modify(|w| {
-                w.set_fircsten(Fircsten::DisabledInStopModes);
-                w.set_fircerr_ie(FircerrIe::ErrorNotDetected);
-                w.set_firc_fclk_periph_en(false);
-                w.set_firc_sclk_periph_en(false);
-                w.set_fircen(false);
-            });
+        //
+        // NOTE: `freq_sel` is `Some` exactly when `enabled` is true.
+        let sel = match (self.resolved.firc.enabled, self.resolved.firc.freq_sel) {
+            (true, Some(sel)) => sel,
+            _ => {
+                // Nope, and we've already switched to fro_12m. Disable FIRC.
+                self.scg0.firccsr().modify(|w| {
+                    w.set_fircsten(Fircsten::DisabledInStopModes);
+                    w.set_fircerr_ie(FircerrIe::ErrorNotDetected);
+                    w.set_firc_fclk_periph_en(false);
+                    w.set_firc_sclk_periph_en(false);
+                    w.set_fircen(false);
+                });
 
-            self.scg0.firccsr().modify(|w| w.set_lk(FirccsrLk::WriteDisabled));
-            return Ok(());
+                self.scg0.firccsr().modify(|w| w.set_lk(FirccsrLk::WriteDisabled));
+                return Ok(());
+            }
         };
 
         // If we are here, we WANT FIRC. If we are !default, let's disable FIRC before
@@ -135,11 +136,7 @@ impl ClockOperator<'_> {
             });
         }
 
-        let limits = self.lowest_relevant_limits(&firc.power);
-
-        // Set frequency (if not the default!), re-enable FIRC, and return the base frequency
-        let (base_freq, sel) = firc.frequency.to_freq_and_sel();
-
+        // Set frequency (if not the default!), re-enable FIRC
         self.scg0.firccfg().modify(|w| w.set_freq_sel(sel));
         self.scg0.firccsr().modify(|w| w.set_fircen(true));
 
@@ -153,59 +150,18 @@ impl ClockOperator<'_> {
         }
 
         // Note that the fro_hf_root is active
-        self.clocks.fro_hf_root = Some(Clock {
-            frequency: base_freq,
-            power: firc.power,
-        });
+        self.clocks.fro_hf_root = self.resolved.clocks.fro_hf_root.clone();
 
         // Okay! Now we're past that, let's enable all the downstream clocks.
-        let FircConfig {
-            frequency: _,
-            power,
-            fro_hf_enabled,
-            clk_hf_fundamental_enabled,
-            fro_hf_div,
-        } = firc;
-
-        // When is the FRO enabled?
-        let bg_good = calc::bandgap_meets_requirement(self.clocks.bandgap_active, self.clocks.bandgap_lowpower, *power);
-        let pow_set = match power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => Fircsten::DisabledInStopModes,
-            PoweredClock::AlwaysEnabled => Fircsten::EnabledInStopModes,
-        };
-        if !bg_good {
-            return Err(ClockError::BadConfig {
-                clock: "fro_hf",
-                reason: "bandgap required to be enabled when clock enabled",
-            });
-        }
+        let pow_set = self.resolved.firc.fircsten;
 
         // Do we enable the `fro_hf` output?
-        let fro_hf_set = if *fro_hf_enabled {
-            match calc::validate_max_frequency(base_freq, limits.fro_hf, "fro_hf", "exceeds max") {
-                Ok(()) => {}
-                Err(e) => return Err(e),
-            }
-
-            self.clocks.fro_hf = Some(Clock {
-                frequency: base_freq,
-                power: *power,
-            });
-            true
-        } else {
-            false
-        };
+        let fro_hf_set = self.resolved.firc.fro_hf_gate;
+        self.clocks.fro_hf = self.resolved.clocks.fro_hf.clone();
 
         // Do we enable the `clk_45m`/`clk_48m` output?
-        let clk_fund_set = if *clk_hf_fundamental_enabled {
-            self.clocks.clk_hf_fundamental = Some(Clock {
-                frequency: calc::CLK_HF_FUNDAMENTAL_FREQUENCY,
-                power: *power,
-            });
-            true
-        } else {
-            false
-        };
+        let clk_fund_set = self.resolved.firc.fundamental_gate;
+        self.clocks.clk_hf_fundamental = self.resolved.clocks.clk_hf_fundamental.clone();
 
         self.scg0.firccsr().modify(|w| {
             w.set_fircsten(pow_set);
@@ -217,42 +173,28 @@ impl ClockOperator<'_> {
         self.scg0.firccsr().modify(|w| w.set_lk(FirccsrLk::WriteDisabled));
 
         // Do we enable the `fro_hf_div` output?
-        if let Some(d) = fro_hf_div.as_ref() {
-            // We need `fro_hf` to be enabled
-            if !*fro_hf_enabled {
-                return Err(ClockError::BadConfig {
-                    clock: "fro_hf_div",
-                    reason: "fro_hf not enabled",
-                });
-            }
-
-            let div_freq = calc::divided_frequency(base_freq, *d);
-            match calc::validate_max_frequency(div_freq, limits.fro_hf_div, "fro_hf_root", "exceeds max frequency") {
-                Ok(()) => {}
-                Err(e) => return Err(e),
-            }
-
+        //
+        // NOTE: the `fro_hf_div` requires `fro_hf` dependency is enforced during
+        // resolution, before we get here.
+        if let Some(div) = self.resolved.firc.fro_hf_div_bits {
             // Halt and reset the div; then set our desired div.
             self.syscon.frohfdiv().write(|w| {
                 w.set_halt(FrohfdivHalt::Halt);
                 w.set_reset(FrohfdivReset::Asserted);
-                w.set_div(d.into_bits());
+                w.set_div(div);
             });
             // Then unhalt it, and reset it
             self.syscon.frohfdiv().write(|w| {
                 w.set_halt(FrohfdivHalt::Run);
                 w.set_reset(FrohfdivReset::Released);
-                w.set_div(d.into_bits());
+                w.set_div(div);
             });
 
             // Wait for clock to stabilize
             while self.syscon.frohfdiv().read().unstab() == FrohfdivUnstab::Ongoing {}
 
             // Store off the clock info
-            self.clocks.fro_hf_div = Some(Clock {
-                frequency: div_freq,
-                power: *power,
-            });
+            self.clocks.fro_hf_div = self.resolved.clocks.fro_hf_div.clone();
         }
 
         Ok(())

@@ -12,6 +12,7 @@
 
 use super::config::CoreSleep;
 use super::types::Clocks;
+use crate::pac::scg::{Fircsten, FreqSel};
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgCoreldoVddDs, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -24,6 +25,30 @@ pub(super) struct ResolvedClockProgram {
     pub(super) voltage: VoltageProgram,
     /// The values `configure_sirc_clocks_early`/`_late` need.
     pub(super) sirc: SircProgram,
+    /// The values `configure_firc_clocks` needs.
+    pub(super) firc: FircProgram,
+}
+
+/// Everything `configure_firc_clocks` derives from the configuration.
+pub(super) struct FircProgram {
+    /// Whether a FIRC configuration was requested at all. When `false`, FIRC is
+    /// disabled and the function returns early.
+    pub(super) enabled: bool,
+    /// Whether the requested FIRC frequency is the chip family's reset default.
+    ///
+    /// NOTE: this is `false` when no FIRC configuration was requested, which is
+    /// what drives the RCCR -> SIRC detour in that case.
+    pub(super) is_default: bool,
+    /// `FIRCCFG[FREQ_SEL]`, if FIRC is enabled.
+    pub(super) freq_sel: Option<FreqSel>,
+    /// `FIRCCSR[FIRCSTEN]`.
+    pub(super) fircsten: Fircsten,
+    /// `FIRCCSR[FIRC_FCLK_PERIPH_EN]`.
+    pub(super) fro_hf_gate: bool,
+    /// `FIRCCSR[FIRC_SCLK_PERIPH_EN]`.
+    pub(super) fundamental_gate: bool,
+    /// `SYSCON[FROHFDIV.DIV]`, if the `fro_hf_div` output is enabled.
+    pub(super) fro_hf_div_bits: Option<u8>,
 }
 
 /// Everything the SIRC/FRO12M configuration steps derive from the configuration.
