@@ -191,6 +191,13 @@ pub enum ClockError {
     /// The requested peripheral could not be configured, as the steps necessary to
     /// enable it have not yet been implemented.
     UnimplementedConfig,
+    /// A hardware ready flag never asserted within the bound allowed for it.
+    ///
+    /// For the VBAT oscillator and LDO this usually means the resource is not
+    /// physically present or cannot start: e.g. OSC32K was enabled on a board
+    /// with no 32.768 kHz crystal fitted, or with one whose ESR exceeds the
+    /// configured `COARSE_AMP_GAIN` range.
+    Timeout { clock: &'static str, flag: &'static str },
 }
 
 /// Information regarding a system clock

@@ -446,6 +446,30 @@ impl ClockOperator<'_> {
 
     /// Configure the ROSC/OSC32K clock family
     #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
+    fn await_vbat_flag(
+        &mut self,
+        clock: &'static str,
+        flag: &'static str,
+        ready: impl Fn(nxp_pac::vbat::Statusa) -> bool,
+    ) -> Result<(), ClockError> {
+        // clocks::init() runs before any timer exists, so this is a bounded spin
+        // rather than a calibrated timeout. The bound only has to guarantee
+        // forward progress; it is deliberately far longer than the datasheet's
+        // 8000 ms worst case (low-power crystal start-up, Table 28) so that a
+        // working oscillator is never rejected.
+        const MAX_POLLS: u32 = 200_000_000;
+
+        for _ in 0..MAX_POLLS {
+            if ready(self.vbat0.statusa().read()) {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(ClockError::Timeout { clock, flag })
+    }
+
+    /// Configure the ROSC/OSC32K clock family
+    #[cfg(all(feature = "mcxa5xx", feature = "unstable-osc32k", not(feature = "rosc-32k-as-gpio")))]
     pub(super) fn configure_osc32k_clocks(&mut self) -> Result<(), ClockError> {
         use config::{Osc32KCapSel, Osc32KCoarseGain, Osc32KMode};
         use nxp_pac::vbat::{
@@ -483,7 +507,11 @@ impl ClockOperator<'_> {
         });
 
         // 3. Wait for STATUSA[LDO_RDY] to become 1.
-        while self.vbat0.statusa().read().ldo_rdy() != StatusaLdoRdy::Set {}
+        //
+        // Datasheet: LDO_RDY sets approximately 8 ms after the bandgap and LDO
+        // are enabled. Bounded so a VBAT domain that cannot come up reports an
+        // error instead of hanging clocks::init() forever.
+        self.await_vbat_flag("LDO", "LDO_RDY", |s| s.ldo_rdy() == StatusaLdoRdy::Set)?;
 
         // 4. Write 1h to LDOLCKA[LOCK].
         self.vbat0.ldolcka().modify(|w| w.set_lock(true));
@@ -547,18 +575,16 @@ impl ClockOperator<'_> {
                 });
 
                 // 2. Wait for STATUSA[OSC_RDY] to become 1.
-                while self.vbat0.statusa().read().osc_rdy() != StatusaOscRdy::Set {}
+                //
+                // Datasheet Table 28: normal-mode crystal start-up is typically
+                // 1000 ms. Bounded so a missing or out-of-spec crystal reports
+                // an error instead of hanging clocks::init() forever.
+                self.await_vbat_flag("OSC32K", "OSC_RDY", |s| s.osc_rdy() == StatusaOscRdy::Set)?;
 
                 // 3. Write 1h to OSCLCKA[LOCK].
                 self.vbat0.osclcka().modify(|w| w.set_lock(true));
 
-                // 4. Write 0h to OSCCTLA[EXTAL_CAP_SEL] and 0h to OSCCTLA[XTAL_CAP_SEL].
-                self.vbat0.oscctla().modify(|w| {
-                    w.set_xtal_cap_sel(XtalCapSel::Sel0);
-                    w.set_extal_cap_sel(ExtalCapSel::Sel0);
-                });
-
-                // 5. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
+                // 4. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
                 const ENABLED: Option<Clock> = Some(Clock {
                     frequency: 32_768,
                     power: PoweredClock::NormalEnabledDeepSleepDisabled,
@@ -626,7 +652,11 @@ impl ClockOperator<'_> {
                 });
 
                 // 3. Wait for STATUSA[OSC_RDY] to become 1.
-                while self.vbat0.statusa().read().osc_rdy() != StatusaOscRdy::Set {}
+                //
+                // Datasheet Table 28: low-power start-up is typically 8000 ms,
+                // the longest wait in the whole clock tree. Bounded so a missing
+                // or out-of-spec crystal reports an error rather than hanging.
+                self.await_vbat_flag("OSC32K", "OSC_RDY", |s| s.osc_rdy() == StatusaOscRdy::Set)?;
 
                 // 4. Write 0h to OSCCFGA[INIT_TRIM].
                 self.vbat0.osccfga().modify(|w| w.set_init_trim(InitTrim::Sel0));
@@ -645,7 +675,7 @@ impl ClockOperator<'_> {
                 });
 
                 // 6. Wait for STATUSA[OSC_RDY] to become 1.
-                while self.vbat0.statusa().read().osc_rdy() != StatusaOscRdy::Set {}
+                self.await_vbat_flag("OSC32K", "OSC_RDY", |s| s.osc_rdy() == StatusaOscRdy::Set)?;
 
                 // 7. Alter OSCCLKE[CLKE] to clock gate different OSC32K outputs to different peripherals to reduce power consumption.
                 const ENABLED: Option<Clock> = Some(Clock {
