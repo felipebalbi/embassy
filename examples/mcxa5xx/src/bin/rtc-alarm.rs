@@ -41,8 +41,11 @@ async fn main(_spawner: Spawner) {
     let mut alarm = now;
     alarm.second += 20;
 
-    defmt::info!("Alarm set for: 2026-03-11 14:30:45 (+20 seconds)");
+    defmt::info!("Alarm set for: 2026-03-11 14:30:30, waiting...");
     rtc.wait_for_alarm(alarm).await.unwrap();
+
+    let at = rtc.now().unwrap();
+    defmt::info!("Alarm fired at {=u8}:{=u8}:{=u8}", at.hour, at.minute, at.second);
 
     defmt::info!("Example complete - Test PASSED!");
 }
