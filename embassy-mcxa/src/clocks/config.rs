@@ -5,7 +5,7 @@
 
 use nxp_pac::scg::FreqSel;
 
-use super::PoweredClock;
+use super::{ClockError, PoweredClock};
 
 /// This type represents a divider in the range 1..=256.
 ///
@@ -139,6 +139,111 @@ pub struct ClocksConfig {
     pub sosc: Option<SoscConfig>,
     /// SPLL
     pub spll: Option<SpllConfig>,
+    /// Board-supplied per-stage Power Down recovery budget, in microseconds.
+    /// Required for [`CoreSleep::PowerDown`]; ignored otherwise. Defaults to `None`.
+    ///
+    /// Cover the slowest configured oscillator's worst-case startup and downstream
+    /// stabilisation. Crystal startup depends on the board's crystal, load and drive.
+    /// An undersized budget can cause fail-stop resets on healthy wakes.
+    ///
+    /// Validation rejects absent, zero or unrepresentable budgets and budgets below
+    /// the configured SPLL minimum. Cycle-based delays may take longer in wall time
+    /// if the recovering core runs slower than its configured frequency.
+    pub power_down_clock_recovery_budget_us: Option<u32>,
+}
+
+impl ClocksConfig {
+    /// SPLL minimum: `500us + ceil(300_000_000 / Fref_hz)`, with `Fref = Fin / N`
+    /// after the pre-divider (both families' `SPLLLOCK_CNFG[LOCK_TIME]`).
+    /// Returns `Ok(0)` without a configured SPLL.
+    fn spll_minimum_budget_us(&self) -> Result<u32, ClockError> {
+        const UNREPRESENTABLE: ClockError = ClockError::BadConfig {
+            clock: "spll",
+            reason: "power_down_clock_recovery_budget_us: SPLL minimum lock time is not representable",
+        };
+
+        let Some(spll) = self.spll.as_ref() else {
+            return Ok(0);
+        };
+
+        // Fin: the SPLL input frequency, before the pre-divider.
+        let fin_hz: u32 = match &spll.source {
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            SpllSource::Sosc => match self.sosc.as_ref() {
+                Some(sosc) => sosc.frequency,
+                None => {
+                    return Err(ClockError::BadConfig {
+                        clock: "spll",
+                        reason: "SPLL source is SOSC, but no SoscConfig was provided",
+                    });
+                }
+            },
+            // Per the SpllSource docs, the FIRC tap feeding the SPLL is the fixed
+            // family fundamental, not the selectable fro_hf frequency.
+            #[cfg(feature = "mcxa2xx")]
+            SpllSource::Firc => 45_000_000,
+            #[cfg(feature = "mcxa5xx")]
+            SpllSource::Firc => 48_000_000,
+            SpllSource::Sirc => 12_000_000,
+        };
+
+        // N: the pre-divider. Mode 1a and 1b bypass it entirely.
+        let n_div: u32 = match &spll.mode {
+            SpllMode::Mode1a { .. } | SpllMode::Mode1b { .. } => 1,
+            SpllMode::Mode1c { n_div, .. } | SpllMode::Mode1d { n_div, .. } => u32::from(*n_div),
+        };
+
+        // Reject arithmetic that cannot represent the minimum.
+        if fin_hz == 0 || n_div == 0 {
+            return Err(UNREPRESENTABLE);
+        }
+        let fref_hz = fin_hz / n_div;
+        if fref_hz == 0 {
+            return Err(UNREPRESENTABLE);
+        }
+
+        // ceil(300_000_000 / Fref_hz), the 300-reference-clock startup term in us.
+        let startup_us = match 300_000_000u32.checked_div(fref_hz) {
+            Some(q) if 300_000_000u32 % fref_hz == 0 => q,
+            Some(q) => q.checked_add(1).ok_or(UNREPRESENTABLE)?,
+            None => return Err(UNREPRESENTABLE),
+        };
+
+        // The 500us PLL lock time.
+        500u32.checked_add(startup_us).ok_or(UNREPRESENTABLE)
+    }
+
+    /// Validate the board's Power Down budget; return `Ok(None)` for other modes.
+    ///
+    /// For Power Down, returns [`ClockError::BadConfig`] for an absent, zero or
+    /// unrepresentable budget, or one below the configured SPLL minimum.
+    pub fn validated_power_down_clock_recovery_budget_us(&self) -> Result<Option<u32>, ClockError> {
+        match self.vdd_power.core_sleep {
+            CoreSleep::WfeUngated | CoreSleep::WfeGated | CoreSleep::DeepSleep => return Ok(None),
+            CoreSleep::PowerDown => {}
+        }
+
+        let budget = self.power_down_clock_recovery_budget_us.ok_or(ClockError::BadConfig {
+            clock: "power_down",
+            reason: "CoreSleep::PowerDown requires a board-supplied power_down_clock_recovery_budget_us",
+        })?;
+
+        if budget == 0 {
+            return Err(ClockError::BadConfig {
+                clock: "power_down",
+                reason: "power_down_clock_recovery_budget_us must be nonzero",
+            });
+        }
+
+        if budget < self.spll_minimum_budget_us()? {
+            return Err(ClockError::BadConfig {
+                clock: "power_down",
+                reason: "power_down_clock_recovery_budget_us is below the configured SPLL lock time",
+            });
+        }
+
+        Ok(Some(budget))
+    }
 }
 
 // Power (which is not a clock)
@@ -244,14 +349,6 @@ pub enum CoreSleep {
     /// This will also move the system into the "low power" state, which will disable any
     /// clocks not configured as `PoweredClock::AlwaysActive".
     ///
-    /// ## TODO
-    ///
-    /// For now, this REQUIRES calling unsafe `okay_but_actually_enable_deep_sleep()`
-    /// otherwise we'd ALWAYS go to deep sleep on every WFE. We need to implement a
-    /// custom executor that does proper go-to-deepsleep and come-back-from-deepsleep
-    /// before un-chickening this. If the method isn't called, we just set to `WfeGated`
-    /// instead.
-    ///
     /// ## WARNING
     ///
     /// Enabling this mode has potential danger to soft-lock the system!
@@ -260,6 +357,19 @@ pub enum CoreSleep {
     /// * This mode WILL also require ISP mode recovery in order to re-flash if the core becomes
     ///   "stuck" in sleep.
     DeepSleep,
+    /// Enter chip-level Power Down when idle, gating the CPU and optionally flash.
+    /// Requires the custom executor and a validated board recovery budget.
+    /// Every entry revalidates a live CPU-resuming WUU external-pin interrupt
+    /// source; refusal falls back to ordinary WFE.
+    ///
+    /// # Warning
+    /// SWD, RTT and defmt disconnect at entry, even with `DBGCTL[SOD]` cleared.
+    /// A stuck sleeping core may require physical ISP recovery before reflashing.
+    ///
+    /// [`clocks::init`](crate::clocks::init()) rejects [`MainClockSource::SPll1`]
+    /// as the main clock: entry drops the PLL's LDO before WFE and this HAL has
+    /// no execution-clock handover. A configured but unselected SPLL is supported.
+    PowerDown,
 }
 
 /// Power control options for the VDD domain, including the CPU and flash memory
@@ -297,6 +407,10 @@ pub enum MainClockSource {
     #[cfg(all(feature = "mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     RoscOsc32K,
     /// Clock derived from `pll1_clk`, via the internal PLL
+    ///
+    /// Rejected with [`CoreSleep::PowerDown`]: entry drops the PLL's LDO and
+    /// this HAL has no execution-clock handover. Configuring an unselected SPLL
+    /// remains supported; other sleep modes may select this source.
     SPll1,
 }
 
@@ -726,6 +840,7 @@ impl Default for ClocksConfig {
             #[cfg(not(feature = "sosc-as-gpio"))]
             sosc: None,
             spll: None,
+            power_down_clock_recovery_budget_us: None,
         }
     }
 }

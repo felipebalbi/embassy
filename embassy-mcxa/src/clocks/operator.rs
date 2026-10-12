@@ -13,11 +13,15 @@ use super::config;
 use super::types::{Clock, ClockError, Clocks, PoweredClock};
 use crate::chips::{ClockLimits, clock_limits};
 use crate::pac;
-use crate::pac::cmc::Ckmode;
+use crate::pac::cmc::{Ckmode, PmctrlmainLpmode};
 use crate::pac::scg::{
     Erefs, Fircacc, FircaccIe, FirccsrLk, Fircerr, FircerrIe, Fircsten, Range, Scs, SirccsrLk, Sircerr, Sircvld,
     SosccsrLk, Soscerr, Source, SpllLock, SpllcsrLk, Spllerr, Spllsten, TrimUnlock,
 };
+#[cfg(feature = "mcxa2xx")]
+use crate::pac::spc::Spc;
+#[cfg(feature = "mcxa5xx")]
+use crate::pac::spc::Spc5xx as Spc;
 use crate::pac::spc::{
     ActiveCfgBgmode, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, LpCfgBgmode, LpCfgCoreldoVddLvl, Vsm,
 };
@@ -25,6 +29,9 @@ use crate::pac::syscon::{
     AhbclkdivUnstab, FrohfdivHalt, FrohfdivReset, FrohfdivUnstab, FrolfdivHalt, FrolfdivReset, FrolfdivUnstab,
     Pll1clkdivHalt, Pll1clkdivReset, Pll1clkdivUnstab, Unlock,
 };
+
+/// Generate events for newly pending interrupts while interrupts are masked.
+const SCR_SEVONPEND: u32 = 1 << 4;
 
 /// The ClockOperator is a private helper type that contains the methods used
 /// during system clock initialization.
@@ -48,7 +55,7 @@ pub(super) struct ClockOperator<'a> {
     pub(super) scg0: pac::scg::Scg,
     pub(super) syscon: pac::syscon::Syscon,
     pub(super) vbat0: pac::vbat::Vbat,
-    pub(super) spc0: pac::spc::Spc,
+    pub(super) spc0: Spc,
     pub(super) fmu0: pac::fmu::Fmu,
     pub(super) cmc: pac::cmc::Cmc,
 }
@@ -1552,6 +1559,43 @@ impl ClockOperator<'_> {
                     // TODO: wait for https://github.com/rust-embedded/cortex-m/commit/1be630fdd06990bd14251eabe4cca9307bde549d
                     // to be released, until then, manual version of SCB.set_sevonpend();
                     scb.scr.modify(|w| w | (1 << 4));
+                }
+            }
+            CoreSleep::PowerDown => {
+                // We can only support power down with a custom executor which properly
+                // handles going to sleep and returning
+                #[cfg(all(not(feature = "executor-platform"), feature = "defmt"))]
+                defmt::warn!("power down enabled without custom executor");
+
+                // GPMCTRL/PMCTRLMAIN survive warm resets; CKCTRL/PMPROT do not.
+                // Normalize to Active with light-sleep clocks before allowing entry.
+                self.cmc.ckctrl().modify(|w| w.set_ckmode(Ckmode::Ckmode0001));
+
+                // Replace prior authorization with Power Down only.
+                self.cmc.pmprot().write(|w| w.0 = 0x0000_0002);
+
+                // Clear any latched low-power request.
+                self.cmc.gpmctrl().modify(|w| w.set_lpmode(0b0000));
+
+                // PMPROT-blocked writes can be ignored; verify normalization.
+                if self.cmc.pmctrlmain().read().lpmode() != PmctrlmainLpmode::Lpmode0000 {
+                    return Err(ClockError::BadConfig {
+                        clock: "CMC",
+                        reason: "PMCTRLMAIN[LPMODE] did not normalize to Active, refusing power down",
+                    });
+                }
+
+                // Debug is disabled when core sleeps
+                self.cmc.dbgctl().modify(|w| w.set_sod(true));
+
+                // Allow the core to be gated - this WILL kill the debugging session!
+                scb.set_sleepdeep();
+
+                // Enable sevonpend, to allow us to wake from WFE sleep with interrupts disabled
+                unsafe {
+                    // TODO: wait for https://github.com/rust-embedded/cortex-m/commit/1be630fdd06990bd14251eabe4cca9307bde549d
+                    // to be released, until then, manual version of SCB.set_sevonpend();
+                    scb.scr.modify(|w| w | SCR_SEVONPEND);
                 }
             }
         }

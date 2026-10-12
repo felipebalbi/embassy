@@ -141,6 +141,17 @@ macro_rules! define_counters {
 // much static RAM space.
 define_counters!(
     deep_sleeps,
+    // Power Down cycle count and per-reason refusal/recovery diagnostics.
+    //
+    // These are best-effort ACTIVE-MEMORY diagnostics only. Each refusal counter marks
+    // a path that returns `false` and falls back to an ordinary WFE, which in the field
+    // is otherwise indistinguishable from a successful Power Down cycle.
+    power_downs,
+    power_down_no_live_wake,
+    power_down_setup_aborts,
+    power_down_clock_timeouts,
+    power_down_spc_failures,
+    power_down_wuu_replay_failures,
     interrupt_adc0,
     interrupt_adc1,
     interrupt_adc2,

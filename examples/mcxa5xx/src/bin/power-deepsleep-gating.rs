@@ -108,7 +108,7 @@ async fn main(_spawner: Spawner) {
     // We create a clkout peripheral so that we can view the activity of the clock
     // in a logic analyzer. We use `new_unchecked` here, which doesn't participate
     // in verifying that the clock sources are always valid, and does not take
-    // a WaitGuard token, which would prevent us from entering deep sleep.
+    // a WakeGuard token, which would prevent us from entering deep sleep.
     let _clock_out = unsafe { ClockOut::new_unchecked(clkout.reborrow(), pin.reborrow(), M1_CONFIG) };
 
     defmt::info!("Going to sleep shortly...");

@@ -39,8 +39,19 @@ default-executor = [
 executor-platform = [
   "embassy-mcxa/executor-platform"
 ]
+powerdown-diag = ["executor-platform", "embassy-mcxa/perf"]
+
+# Forward to the HAL's compile-time rejection of retained-RAM zeroing.
+# This does not detect cortex-m-rt features enabled through other dependencies.
+zero-init-ram = ["embassy-mcxa/zero-init-ram"]
 mcxa5xx = []
 unstable-pac = []
+
+# WUU low-power examples require the custom executor; default builds skip them.
+[[bin]]
+name = "power-powerdown-wuu"
+path = "src/bin/power-powerdown-wuu.rs"
+required-features = ["executor-platform"]
 
 [[bin]]
 name = "wuu-wake-deepsleep"

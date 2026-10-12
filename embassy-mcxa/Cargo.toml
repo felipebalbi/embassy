@@ -60,7 +60,7 @@ grounded = { version = "0.2.1", features = ["cas", "critical-section"] }
 heapless = "0.9"
 maitake-sync = { version = "0.3.0", default-features = false, features = ["critical-section", "no-cache-pad"] }
 nb = "1.1.0"
-nxp-pac = { git = "https://github.com/embassy-rs/nxp-pac.git", rev = "2bfe368b9ad974d03a41279bddb1ef05705ae9d8", features = ["rt"] }
+nxp-pac = { git = "https://github.com/embassy-rs/nxp-pac.git", rev = "c88e7b3aacd16e8c0b400fffc5e0b4d92511ac8a", features = ["rt"] }
 paste = "1.0.15"
 
 rand-core-06 = { package = "rand_core", version = "0.6" }
@@ -68,7 +68,7 @@ rand-core-09 = { package = "rand_core", version = "0.9" }
 rand-core-10 = { package = "rand_core", version = "0.10" }
 
 [build-dependencies]
-nxp-pac = { git = "https://github.com/embassy-rs/nxp-pac.git", rev = "2bfe368b9ad974d03a41279bddb1ef05705ae9d8", default-features = false, features = ["metadata"] }
+nxp-pac = { git = "https://github.com/embassy-rs/nxp-pac.git", rev = "c88e7b3aacd16e8c0b400fffc5e0b4d92511ac8a", default-features = false, features = ["metadata"] }
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 regex = "1.12.3"
@@ -150,6 +150,11 @@ perf = []
 
 # Enable irq tracing
 trace = []
+
+# Forbidden: startup zeroing would erase the retained Power Down record.
+# The compile-time guard sees only this feature, not graph-wide cortex-m-rt
+# feature unification. The runtime canary cannot prove retention either.
+zero-init-ram = ["cortex-m-rt/zero-init-ram"]
 
 # Enable the custom executor platform implementation, which allows for low-power modes.
 #

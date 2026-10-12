@@ -174,6 +174,52 @@ impl Executor {
                     }
                 }
             },
+            CoreSleep::PowerDown => loop {
+                unsafe {
+                    // Power Down mirrors deep sleep exactly. First, poll any
+                    // pending tasks
+                    self.inner.poll();
+
+                    if go_around() {
+                        continue;
+                    }
+
+                    // Next, we need to check if any high-power peripherals exist that should
+                    // inhibit us from entering power down, and whether there is still a
+                    // live CPU-resuming WUU wake source. Take a critical section to check.
+                    //
+                    // We STAY in the CS for the power down to ensure that we handle wake-up
+                    // completely BEFORE yielding control flow back to interrupts. A
+                    // preflight answer that could go stale before the WFE would not be a
+                    // preflight at all.
+                    //
+                    // `power_down_if_possible` is fail-closed: it returns `false` for every
+                    // refusal, having left the chip exactly as it found it, and never
+                    // returns at all if masked recovery fails - it requests a system reset
+                    // (`SCB::sys_reset`) rather than unmasking into a half-recovered part.
+                    embassy_executor::trace_idle();
+                    debug_lo();
+                    let do_wfe_sleep = critical_section::with(|cs| {
+                        let did_power_down = crate::clocks::power_down_if_possible(&cs);
+                        if did_power_down {
+                            debug_hi();
+                        }
+                        !did_power_down
+                    });
+
+                    // Did we succeed at powering down?
+                    if do_wfe_sleep {
+                        // Nope, WFE. We don't need a critical section here because we don't
+                        // need to wait for clocks to resume before we service interrupts.
+                        do_wfe();
+                        debug_hi();
+                        crate::perf_counters::incr_wfe_sleeps();
+                    } else {
+                        // Yep! Entry AND masked recovery both completed.
+                        crate::perf_counters::incr_power_downs();
+                    }
+                }
+            },
         }
     }
 }

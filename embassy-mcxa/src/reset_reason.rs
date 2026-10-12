@@ -80,6 +80,19 @@ impl ResetReasonRaw {
         (1 << 30, ResetReason::SecurityViolation),
     ];
 
+    /// Whether the word contains exactly these reset causes.
+    /// Unknown bits or unmapped causes never match; ordering and duplicates are ignored.
+    pub fn is_exactly(&self, reasons: &[ResetReason]) -> bool {
+        let mut expected = 0;
+        for reason in reasons {
+            let Some((mask, _)) = Self::MAP.iter().find(|(_, mapped)| mapped == reason) else {
+                return false;
+            };
+            expected |= mask;
+        }
+        self.0 == expected
+    }
+
     /// Wake up
     #[inline]
     pub fn is_wakeup(&self) -> bool {
@@ -209,7 +222,7 @@ impl Iterator for ResetReasonRawIter {
 }
 
 /// Indicates the type and source of the most recent reset.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum ResetReason {
@@ -271,4 +284,44 @@ pub enum ResetReason {
 
     /// Wake-up reset.
     WakeUp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResetReason, ResetReasonRaw};
+
+    #[test]
+    fn exact_match_accepts_only_the_listed_causes() {
+        let reason = ResetReasonRaw((1 << 14) | (1 << 4));
+        assert!(reason.is_exactly(&[ResetReason::Software, ResetReason::Warm]));
+        assert!(reason.is_exactly(&[ResetReason::Warm, ResetReason::Software]));
+        assert!(!reason.is_exactly(&[ResetReason::Software]));
+        assert!(!reason.is_exactly(&[ResetReason::Software, ResetReason::Warm, ResetReason::Pin]));
+    }
+
+    #[test]
+    fn exact_match_rejects_unknown_bits() {
+        let reason = ResetReasonRaw((1 << 1) | (1 << 3));
+        assert!(reason.is_por());
+        assert!(!reason.is_exactly(&[ResetReason::Por]));
+    }
+
+    #[test]
+    fn exact_match_handles_empty_and_duplicate_sets() {
+        assert!(ResetReasonRaw(0).is_exactly(&[]));
+        assert!(!ResetReasonRaw(1 << 1).is_exactly(&[]));
+        assert!(ResetReasonRaw(1 << 1).is_exactly(&[ResetReason::Por, ResetReason::Por]));
+    }
+
+    #[test]
+    fn unmapped_causes_do_not_match_an_empty_word() {
+        assert!(!ResetReasonRaw(0).is_exactly(&[ResetReason::Tamper]));
+    }
+
+    #[cfg(feature = "mcxa5xx")]
+    #[test]
+    fn exact_match_includes_family_specific_causes() {
+        assert!(ResetReasonRaw(1 << 25).is_exactly(&[ResetReason::Wwdt1]));
+        assert!(ResetReasonRaw(1 << 30).is_exactly(&[ResetReason::SecurityViolation]));
+    }
 }

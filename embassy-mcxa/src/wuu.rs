@@ -1,7 +1,7 @@
 //! Wake-Up Unit pin and module wake sources.
 //!
-//! External inputs have typed detection modes and power scopes.
-//! Interrupt-mode waits retain events across cancellation.
+//! External inputs have typed detection modes and power scopes. Interrupt-mode
+//! waits retain events across cancellation; Power Down recovery replays live arms.
 //! PF/PMC use global input indices, while PE/PDC use bank-local indices.
 //! The WUU has no MRCC gate and does not take a clock power vote.
 
@@ -147,6 +147,46 @@ static WUU_EVENTS: critical_section::Mutex<Cell<u32>> = critical_section::Mutex:
 static WUU_ARMED: critical_section::Mutex<Cell<u32>> = critical_section::Mutex::new(Cell::new(0));
 /// Sticky diagnostic mask of PF observations not owned by a live handle.
 static WUU_UNEXPECTED: critical_section::Mutex<Cell<u32>> = critical_section::Mutex::new(Cell::new(0));
+/// Sticky mask of inputs whose arms could not be restored after Power Down.
+static WUU_RECOVERY_FAILED: critical_section::Mutex<Cell<u32>> = critical_section::Mutex::new(Cell::new(0));
+/// Desired module wake enables, retained for recovery.
+static WUU_ME_DESIRED: critical_section::Mutex<Cell<u32>> = critical_section::Mutex::new(Cell::new(0));
+/// Desired module DMA/trigger enables, retained for recovery.
+static WUU_DE_DESIRED: critical_section::Mutex<Cell<u32>> = critical_section::Mutex::new(Cell::new(0));
+
+/// What one WUU external input was last successfully armed with.
+#[derive(Clone, Copy)]
+struct WuuArmRecord {
+    /// A successfully read-back arm exists for this input.
+    live: bool,
+    /// A replay of this record failed; the handle is no longer armed.
+    invalid: bool,
+    /// The recorded mode is interrupt, the only CPU-resuming one.
+    interrupt: bool,
+    /// Raw `WUPEn` encoding.
+    pe_code: u8,
+    /// Raw `WUPDCn` encoding.
+    pdc_code: u8,
+    /// Raw `WUPMCn` encoding.
+    scope_code: u8,
+}
+
+impl WuuArmRecord {
+    const fn empty() -> Self {
+        Self {
+            live: false,
+            invalid: false,
+            interrupt: false,
+            pe_code: 0,
+            pdc_code: 0,
+            scope_code: 0,
+        }
+    }
+}
+
+/// One recovery record per globally indexed input.
+static WUU_ARM_RECORDS: [critical_section::Mutex<Cell<WuuArmRecord>>; WUU_SLOTS] =
+    [const { critical_section::Mutex::new(Cell::new(WuuArmRecord::empty())) }; WUU_SLOTS];
 
 fn write_pmc(index: GlobalWuuPinIndex, scope: Wupmc) {
     crate::pac::WUU0.pmc().modify(|w| w.set_wupmc(index.0 as usize, scope));
@@ -278,7 +318,7 @@ impl WakeMode for Trigger {}
 pub trait DetectionScope: sealed::SealedDetectionScope {}
 
 /// Detect only in low-leakage modes (`Wupmc::LowPwrOnly`).
-/// No current `CoreSleep` mode supports this scope; use [`AllPowerModes`].
+/// Compatible only with [`CoreSleep::PowerDown`]; other modes reject this scope.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PowerDownOnly;
@@ -506,7 +546,7 @@ pub enum WuuArmError {
     IncompatibleScope,
     /// Interrupt mode was requested while the WUU0 NVIC line is disabled.
     InterruptDisabled,
-    /// Interrupt wake in Deep Sleep requires `SCR.SEVONPEND`.
+    /// Interrupt wake in Deep Sleep or Power Down requires `SCR.SEVONPEND`.
     SevOnPendClear,
     /// PE, PDC or PMC read-back mismatched; full teardown has already run.
     ReadbackMismatch,
@@ -543,6 +583,18 @@ pub struct WuuArmFailure<'p> {
     pub pin: AnyWuuPin<'p>,
 }
 
+/// Why masked Power Down recovery could not restore the WUU.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum WuuRecoveryError {
+    /// An arm read-back differed from its record; the transaction was rolled back.
+    ReplayMismatch {
+        /// Global WUU input, 0..=31, whose replay was refused by hardware.
+        global_input: u8,
+    },
+}
+
 /// Is the WUU0 NVIC line enabled?
 fn wuu_irq_enabled() -> bool {
     crate::interrupt::typelevel::WUU0::is_enabled()
@@ -561,6 +613,7 @@ fn scope_wakes(sleep: CoreSleep, all_power: bool) -> bool {
         CoreSleep::WfeUngated => all_power,
         CoreSleep::WfeGated => all_power,
         CoreSleep::DeepSleep => all_power,
+        CoreSleep::PowerDown => true,
     }
 }
 
@@ -570,6 +623,7 @@ fn requires_sevonpend(sleep: CoreSleep) -> bool {
         CoreSleep::WfeUngated => false,
         CoreSleep::WfeGated => false,
         CoreSleep::DeepSleep => true,
+        CoreSleep::PowerDown => true,
     }
 }
 
@@ -582,11 +636,15 @@ fn reset_all_wuu_state(cs: CriticalSection) {
         if (FAMILY_PF_WRITABLE_MASK & (1u32 << i)) != 0 {
             disable_pin_registers(WuuPinInfo::new(i as u8), true);
         }
+        WUU_ARM_RECORDS[i].borrow(cs).set(WuuArmRecord::empty());
         i += 1;
     }
     WUU_ARMED.borrow(cs).set(0);
     WUU_EVENTS.borrow(cs).set(0);
     WUU_UNEXPECTED.borrow(cs).set(0);
+    WUU_RECOVERY_FAILED.borrow(cs).set(0);
+    WUU_ME_DESIRED.borrow(cs).set(0);
+    WUU_DE_DESIRED.borrow(cs).set(0);
 }
 
 /// The WUU peripheral instance.
@@ -762,6 +820,7 @@ impl<'d> Wuu<'d> {
 
         let info = pin.info;
         let bit = 1u32 << info.global_index;
+        let slot = info.global_index as usize;
         let scope_code = <S as sealed::SealedDetectionScope>::PMC_CODE;
 
         pin.flex.set_as_input();
@@ -776,6 +835,9 @@ impl<'d> Wuu<'d> {
                 armed.set(armed.get() & !bit);
                 let events = WUU_EVENTS.borrow(cs);
                 events.set(events.get() & !bit);
+                WUU_ARM_RECORDS[slot].borrow(cs).set(WuuArmRecord::empty());
+                let sticky = WUU_RECOVERY_FAILED.borrow(cs);
+                sticky.set(sticky.get() & !bit);
                 return false;
             }
             let armed = WUU_ARMED.borrow(cs);
@@ -786,6 +848,16 @@ impl<'d> Wuu<'d> {
             }
             let events = WUU_EVENTS.borrow(cs);
             events.set(events.get() & !bit);
+            WUU_ARM_RECORDS[slot].borrow(cs).set(WuuArmRecord {
+                live: true,
+                invalid: false,
+                interrupt: <M as sealed::SealedWakeMode>::IS_INTERRUPT,
+                pe_code: wake.pe_code,
+                pdc_code: wake.pdc_code,
+                scope_code,
+            });
+            let sticky = WUU_RECOVERY_FAILED.borrow(cs);
+            sticky.set(sticky.get() & !bit);
             true
         });
 
@@ -809,7 +881,7 @@ impl<'d> Wuu<'d> {
     /// Idempotent; the source module's own interrupt dispatches, not WUU0.
     /// This cannot make a module wake Deep Sleep.
     pub fn power_down_module_wake(&self, source: ModuleWake, enable: bool) {
-        critical_section::with(|_cs| {
+        critical_section::with(|cs| {
             crate::pac::WUU0.me().modify(|w| match source {
                 ModuleWake::SpcInterrupt => w.set_wume0(enable),
                 #[cfg(feature = "mcxa2xx")]
@@ -828,13 +900,14 @@ impl<'d> Wuu<'d> {
                 ModuleWake::Lptmr0Interrupt => w.set_wume6(enable),
                 ModuleWake::Cmp0Interrupt => w.set_wume8(enable),
             });
+            WUU_ME_DESIRED.borrow(cs).set(crate::pac::WUU0.me().read().0);
         });
     }
 
     /// Enable or disable transient DMA/trigger servicing for one module.
     /// Idempotent; this is not a CPU wake.
     pub fn module_dma_servicing(&self, source: ModuleDmaService, enable: bool) {
-        critical_section::with(|_cs| {
+        critical_section::with(|cs| {
             crate::pac::WUU0.de().modify(|w| match source {
                 #[cfg(feature = "mcxa5xx")]
                 ModuleDmaService::Gpio5Dma0 => w.set_wude0(enable),
@@ -848,6 +921,7 @@ impl<'d> Wuu<'d> {
                 ModuleDmaService::Lptmr0Trigger => w.set_wude6(enable),
                 ModuleDmaService::Cmp0Dma => w.set_wude8(enable),
             });
+            WUU_DE_DESIRED.borrow(cs).set(crate::pac::WUU0.de().read().0);
         });
     }
 
@@ -862,6 +936,12 @@ impl<'d> Wuu<'d> {
             let unexpected = WUU_UNEXPECTED.borrow(cs);
             unexpected.set(unexpected.get() & !mask.0);
         });
+    }
+
+    /// Sticky mask of inputs whose arms could not be restored after Power Down.
+    /// Teardown, a fresh successful arm or a new WUU clears the corresponding diagnostic.
+    pub fn power_down_recovery_failures(&self) -> u32 {
+        critical_section::with(|cs| WUU_RECOVERY_FAILED.borrow(cs).get())
     }
 }
 
@@ -907,6 +987,13 @@ impl<'p, M: WakeMode> WuuInput<'_, 'p, M> {
         });
     }
 
+    /// Whether recovery left this input unarmed.
+    /// Repair by disarming and arming the returned pin again.
+    pub fn power_down_recovery_failed(&self) -> bool {
+        let bit = 1u32 << self.pin.info.global_index;
+        critical_section::with(|cs| (WUU_RECOVERY_FAILED.borrow(cs).get() & bit) != 0)
+    }
+
     /// Shared teardown for disable, disarm and Drop, run at most once.
     fn teardown(&self) {
         if self.torn_down.get() {
@@ -914,12 +1001,16 @@ impl<'p, M: WakeMode> WuuInput<'_, 'p, M> {
         }
         self.torn_down.set(true);
         let bit = 1u32 << self.pin.info.global_index;
+        let slot = self.pin.info.global_index as usize;
         critical_section::with(|cs| {
             disable_pin_registers(self.pin.info, true);
             let armed = WUU_ARMED.borrow(cs);
             armed.set(armed.get() & !bit);
             let events = WUU_EVENTS.borrow(cs);
             events.set(events.get() & !bit);
+            WUU_ARM_RECORDS[slot].borrow(cs).set(WuuArmRecord::empty());
+            let sticky = WUU_RECOVERY_FAILED.borrow(cs);
+            sticky.set(sticky.get() & !bit);
         });
         self.pin.flex.set_as_disabled();
     }
@@ -956,4 +1047,149 @@ impl WuuInput<'_, '_, Interrupt> {
             .await
             .expect("WUU wait queues are never closed");
     }
+}
+
+/// Require a live interrupt-mode arm with matching hardware configuration.
+/// Also checks IRQ, SEVONPEND and hardware LPO readiness; ME/DE do not qualify.
+pub(crate) fn power_down_preflight(cs: &CriticalSection) -> bool {
+    let cs = *cs;
+
+    let nvic_ready = wuu_irq_enabled();
+    if !nvic_ready || !sevonpend_set() {
+        return false;
+    }
+
+    let vbat = crate::pac::VBAT0;
+    if !vbat.froctla().read().fro_en() || !vbat.froclke().read().clke(FROCLKE_CLK_16K_0) {
+        return false;
+    }
+
+    let failed = WUU_RECOVERY_FAILED.borrow(cs).get();
+    let mut i = 0;
+    while i < WUU_SLOTS {
+        let record = WUU_ARM_RECORDS[i].borrow(cs).get();
+        let usable = record.live && record.interrupt && !record.invalid && (failed & (1u32 << i)) == 0;
+        if usable {
+            let info = WuuPinInfo::new(i as u8);
+            let b = info.banked_index();
+            let g = info.global_index();
+            let pe = read_pe(b) == record.pe_code;
+            let pdc = read_pdc(b) == record.pdc_code;
+            let pmc = read_pmc(g) == record.scope_code;
+            if pe && pdc && pmc {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Restore recorded arms and ME/DE as an all-or-nothing transaction.
+/// Drains and publishes flags before and after replay; replay never clears PF.
+///
+/// # Safety
+/// The caller must hold `cs` throughout recovery and keep interrupts masked since wake.
+pub(crate) unsafe fn recover_after_power_down(cs: &CriticalSection) -> Result<(), WuuRecoveryError> {
+    let cs = *cs;
+    let wuu = crate::pac::WUU0;
+
+    let snapshot = wuu.pf().read().0;
+    wuu.pf().write_value(Pf(snapshot & FAMILY_PF_WRITABLE_MASK));
+
+    // Publish the drained flags before replay; preserve new PF flags until the late drain.
+    let armed = WUU_ARMED.borrow(cs).get();
+    let owned = snapshot & armed;
+    let events = WUU_EVENTS.borrow(cs);
+    events.set(events.get() | owned);
+    let unexpected = WUU_UNEXPECTED.borrow(cs);
+    unexpected.set(unexpected.get() | (snapshot & !armed));
+    let mut i = 0;
+    while i < WUU_SLOTS {
+        if (owned & (1u32 << i)) != 0 {
+            WUU_WAIT_QUEUES[i].wake_all();
+        }
+        i += 1;
+    }
+
+    let mut i = 0;
+    while i < WUU_SLOTS {
+        if WUU_ARM_RECORDS[i].borrow(cs).get().live {
+            disable_pin_registers(WuuPinInfo::new(i as u8), false);
+        }
+        i += 1;
+    }
+    wuu.me().write_value(Me(0));
+    wuu.de().write_value(De(0));
+
+    let mut failed_input: Option<u8> = None;
+    let mut i = 0;
+    while i < WUU_SLOTS {
+        let record = WUU_ARM_RECORDS[i].borrow(cs).get();
+        if record.live {
+            let info = WuuPinInfo::new(i as u8);
+            arm_pin_registers(info, record.pdc_code, record.pe_code, record.scope_code, false);
+            let ok = verify_pin_registers(info, record.pdc_code, record.pe_code, record.scope_code);
+            if !ok && failed_input.is_none() {
+                failed_input = Some(i as u8);
+            }
+        }
+        i += 1;
+    }
+
+    if let Some(global_input) = failed_input {
+        let mut affected = 0u32;
+        let mut i = 0;
+        while i < WUU_SLOTS {
+            let cell = WUU_ARM_RECORDS[i].borrow(cs);
+            let mut record = cell.get();
+            if record.live {
+                disable_pin_registers(WuuPinInfo::new(i as u8), false);
+                affected |= 1u32 << i;
+                record.invalid = true;
+                cell.set(record);
+            }
+            i += 1;
+        }
+        wuu.me().write_value(Me(0));
+        wuu.de().write_value(De(0));
+
+        // Publish failure and a retained synthetic event before waking affected waiters.
+        let sticky = WUU_RECOVERY_FAILED.borrow(cs);
+        sticky.set(sticky.get() | affected);
+
+        let blocked = affected & WUU_ARMED.borrow(cs).get();
+        let events = WUU_EVENTS.borrow(cs);
+        events.set(events.get() | blocked);
+        let mut i = 0;
+        while i < WUU_SLOTS {
+            if (blocked & (1u32 << i)) != 0 {
+                WUU_WAIT_QUEUES[i].wake_all();
+            }
+            i += 1;
+        }
+        // PF remains pending for the ISR after interrupts are unmasked.
+        return Err(WuuRecoveryError::ReplayMismatch { global_input });
+    }
+
+    wuu.me().write_value(Me(WUU_ME_DESIRED.borrow(cs).get()));
+    wuu.de().write_value(De(WUU_DE_DESIRED.borrow(cs).get()));
+
+    let late = wuu.pf().read().0;
+    wuu.pf().write_value(Pf(late & FAMILY_PF_WRITABLE_MASK));
+    let armed = WUU_ARMED.borrow(cs).get();
+    let owned = late & armed;
+    let events = WUU_EVENTS.borrow(cs);
+    events.set(events.get() | owned);
+    let unexpected = WUU_UNEXPECTED.borrow(cs);
+    unexpected.set(unexpected.get() | (late & !armed));
+    let mut i = 0;
+    while i < WUU_SLOTS {
+        if (owned & (1u32 << i)) != 0 {
+            WUU_WAIT_QUEUES[i].wake_all();
+        }
+        i += 1;
+    }
+
+    Ok(())
 }

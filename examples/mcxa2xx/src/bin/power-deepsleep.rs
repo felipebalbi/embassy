@@ -6,7 +6,29 @@
 //! cargo run --release --no-default-features --features=executor-platform --bin power-deepsleep
 //! ```
 //!
-//! As written, this achieves 153uA average current when measured with a Nordic PPK2.
+//! # Measured current, and what each number measures
+//!
+//! As written, this achieves **153uA average current** when measured with a
+//! Nordic PPK2. That figure is a **duty-cycle average over the full 1 s
+//! cycle** at the bottom of this file: 900 ms asleep with the red LED off,
+//! then 100 ms awake with it lit, plus the two wake events that bracket them.
+//! It is correct for what it measures, and it is deliberately left unchanged.
+//!
+//! A later PPK2 session measured the **floor during the 900 ms sleep segment
+//! alone** at **approximately 142 uA**. That is a different quantity, not a
+//! correction: a sleep floor *below* the whole-cycle average is what a sound
+//! measurement looks like, because the average also carries the lit-LED and
+//! wake-event portions of the cycle. A floor *above* the average would have
+//! meant the rig was wrong.
+//!
+//! Quote the right one. The **153 uA average** describes this example's
+//! behaviour as a whole; the **~142 uA floor** is the only figure comparable
+//! to a steady sleeping current such as the 84.2 uA recorded in
+//! `power-powerdown-wuu.rs`, which has no duty cycle and sleeps until SW2.
+//!
+//! Both were taken on an FRDM-MCXA266 with a PPK2 at **JP1** (`IDD_MCU`),
+//! which UM12439 Table 8 defines as VDD_MCU target MCU total power, analog +
+//! digital.
 //!
 //! **NOTE: This requires rework of the board! You must remove R26 (used for the on
 //! board op-amp), remove R52, and bodge the pad of R52 that is closest to R61 to TP9
@@ -86,6 +108,10 @@ async fn main(_spawner: Spawner) {
     cortex_m::asm::delay(45_000_000 / 4);
 
     let mut red = Output::new(p.P3_18, Level::High, DriveStrength::Normal, SlewRate::Slow);
+    // THIS is the duty cycle the 153 uA figure averages over: 900 ms asleep
+    // with red off, 100 ms awake with red lit, plus the two wake events. The
+    // ~142 uA floor quoted in the header is the 900 ms segment alone. See the
+    // module header before quoting either number.
     loop {
         Timer::after_millis(900).await;
         red.set_low();

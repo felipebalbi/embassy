@@ -171,6 +171,10 @@ pub struct Clocks {
 
     /// `pll1_clk_div` is a configurable frequency clock, sourced from `pll1_clk`
     pub pll1_clk_div: Option<Clock>,
+
+    /// Init-validated board recovery budget, in microseconds per Power Down
+    /// stage. `None` for other sleep modes.
+    pub(crate) power_down_clock_recovery_budget_us: Option<u32>,
 }
 
 /// `ClockError` is the main error returned when configuring or checking clock state

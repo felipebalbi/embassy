@@ -6,6 +6,15 @@
 // Allow functions with too many args - we have a lot of HAL constructors like this for now
 #![allow(clippy::too_many_arguments)]
 
+// Startup RAM zeroing would erase the retained Power Down fail-stop record.
+// This guard sees only the HAL feature, not graph-wide cortex-m-rt feature
+// unification. The runtime canary is not proof of retention.
+#[cfg(feature = "zero-init-ram")]
+compile_error!(
+    "embassy-mcxa is incompatible with cortex-m-rt/zero-init-ram: it would zero the `.uninit` section \
+     holding the Power Down masked-recovery record, silently disabling the anti-reset-loop barrier."
+);
+
 /// Module for MCXA2xx-specific HAL drivers
 ///
 /// NOTE: *for now*, some items are here because we haven't validated them on the MCXA5xx yet.
@@ -72,6 +81,8 @@ pub mod rtc;
 pub mod rtc;
 #[cfg(mcxa_sgi)]
 pub mod sgi;
+#[cfg(any(feature = "mcxa2xx", feature = "mcxa5xx"))]
+pub mod spc;
 #[cfg(mcxa_lpspi)]
 pub mod spi;
 #[cfg(mcxa_trng)]
