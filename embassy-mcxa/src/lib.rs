@@ -76,6 +76,8 @@ pub mod sgi;
 pub mod spi;
 #[cfg(mcxa_trng)]
 pub mod trng;
+#[cfg(mcxa_wuu)]
+pub mod wuu;
 #[cfg(mcxa_wwdt)]
 pub mod wwdt;
 

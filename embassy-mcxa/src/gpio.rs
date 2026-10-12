@@ -596,6 +596,11 @@ impl<'d> Flex<'d> {
 }
 
 impl<'d, M: Mode> Flex<'d, M> {
+    /// Disable the pad while retaining ownership of the pin.
+    pub(crate) fn set_as_disabled(&self) {
+        self.pin.set_as_disabled();
+    }
+
     #[inline]
     fn gpio(&self) -> crate::pac::gpio::Gpio {
         self.pin.gpio()
@@ -838,7 +843,7 @@ impl<'d> Flex<'d, Async> {
 impl<'d, M: Mode> Drop for Flex<'d, M> {
     #[inline]
     fn drop(&mut self) {
-        self.pin.set_as_disabled();
+        self.set_as_disabled();
     }
 }
 

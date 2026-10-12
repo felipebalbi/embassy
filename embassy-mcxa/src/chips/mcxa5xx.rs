@@ -20,6 +20,9 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
     crate::interrupt::GPIO3.set_priority(cfg.gpio_interrupt_priority);
     crate::interrupt::GPIO4.set_priority(cfg.gpio_interrupt_priority);
     crate::interrupt::GPIO5.set_priority(cfg.gpio_interrupt_priority);
+    // Priority only. `Wuu::new` exclusively owns disabling, draining stale
+    // flags, unpending and enabling the WUU0 IRQ.
+    crate::interrupt::WUU0.set_priority(cfg.wuu_interrupt_priority);
 
     // Configure clocks
     crate::clocks::init(cfg.clock_cfg).unwrap();

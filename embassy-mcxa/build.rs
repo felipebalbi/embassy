@@ -49,6 +49,7 @@ fn main() {
         generate_instance_calls(),
         generate_gpio_pin_impls(),
         generate_adc_pin_impls(),
+        generate_wuu_pin_impls(),
         generate_clkout_impls(),
         generate_lpi2c_pin_impls(),
         generate_i3c_pin_impls(),
@@ -287,6 +288,104 @@ fn generate_adc_pin_impls() -> TokenStream {
                     crate::impl_adc_pin!(#pin_name, #adc_name, #channel);
                 });
             }
+        }
+    }
+
+    generated
+}
+
+/// Validate WUU `IN<n>` metadata and sort by numeric suffix, not metadata order.
+fn wuu_validate_signals(entries: &[WuuSignalEntry<'_>]) -> Result<Vec<(u8, String)>, WuuMetadataError> {
+    assert!(
+        entries.len() <= WUU_MAX_INPUTS,
+        "WUU signal set has {} entries, more than the {WUU_MAX_INPUTS}-input register file",
+        entries.len()
+    );
+
+    let in_regex = Regex::new(r"^IN([0-9]+)$").unwrap();
+    let mut parsed: Vec<(u8, String)> = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let Some(captures) = in_regex.captures(entry.name) else {
+            return Err(WuuMetadataError::MalformedSignalName(entry.name.to_string()));
+        };
+
+        // Reject indices outside the 32-input register file.
+        let index = match captures[1].parse::<u32>() {
+            Ok(index) if index < 32 => index as u8,
+            _ => return Err(WuuMetadataError::IndexOutOfRange(entry.name.to_string())),
+        };
+
+        match entry.pins.len() {
+            1 => {}
+            0 => return Err(WuuMetadataError::ZeroPinEntry(entry.name.to_string())),
+            _ => return Err(WuuMetadataError::MultiPinEntry(entry.name.to_string())),
+        }
+        let pin = entry.pins[0].to_string();
+
+        if parsed.iter().any(|(seen, _)| *seen == index) {
+            return Err(WuuMetadataError::DuplicateIndex(index, entry.name.to_string()));
+        }
+        if parsed.iter().any(|(_, seen)| *seen == pin) {
+            return Err(WuuMetadataError::DuplicatePinName(pin));
+        }
+
+        parsed.push((index, pin));
+    }
+
+    // Metadata names are sorted lexicographically, not numerically.
+    parsed.sort_unstable_by_key(|(index, _)| *index);
+    Ok(parsed)
+}
+
+fn generate_wuu_pin_impls() -> TokenStream {
+    let wuu = METADATA
+        .peripherals
+        .iter()
+        .find(|p| p.name == "WUU0" && p.driver_name == "mcxa/WUU")
+        .unwrap_or_else(|| panic!("WUU metadata error: {:?}", WuuMetadataError::MissingWuu0));
+
+    // Keep the pin lists alive while entries borrow them.
+    let pin_lists: Vec<Vec<&str>> = wuu
+        .signals
+        .iter()
+        .map(|signal| signal.pins.iter().map(|pin| pin.pin).collect())
+        .collect();
+    let entries: Vec<WuuSignalEntry<'_>> = wuu
+        .signals
+        .iter()
+        .zip(pin_lists.iter())
+        .map(|(signal, pins)| WuuSignalEntry {
+            name: signal.name,
+            pins: pins.as_slice(),
+        })
+        .collect();
+
+    let parsed = wuu_validate_signals(&entries).unwrap_or_else(|e| panic!("WUU metadata error: {e:?}"));
+
+    // Keep generated armability aligned with the driver's established support policy.
+    // Shared PAC array bounds alone do not establish per-family input support.
+    let armable_mask: u32 = match METADATA.name {
+        "MCXA256" => 0x3fff_ffff, // MCXA2 support policy excludes inputs 30 and 31.
+        "MCXA577" => 0x4fff_ffff, // MCXA5 support policy excludes inputs 28, 29 and 31.
+        name => panic!("WUU armability is not defined for chip {name}"),
+    };
+
+    let mut generated = TokenStream::new();
+    for (index, pin_name) in &parsed {
+        let pin_ident = format_ident!("{}", pin_name);
+        let index_lit = proc_macro2::Literal::u8_unsuffixed(*index);
+        let feature_gate = pin_feature_gate(pin_name);
+
+        generated.extend(quote! {
+            #feature_gate
+            crate::impl_wuu_pin!(#pin_ident, #index_lit);
+        });
+        if armable_mask & (1u32 << *index) != 0 {
+            generated.extend(quote! {
+                #feature_gate
+                impl crate::wuu::sealed::SealedWuuArmablePin for crate::peripherals::#pin_ident {}
+            });
         }
     }
 
@@ -642,3 +741,32 @@ fn get_regex_num(string: &str, regex: &Regex) -> Option<u32> {
         .captures(string)
         .map(|cap| cap.extract::<1>().1[0].parse::<u32>().unwrap())
 }
+
+/// Borrowed WUU signal name and GPIO pins from PAC metadata.
+#[derive(Debug, Clone, Copy)]
+pub struct WuuSignalEntry<'a> {
+    pub name: &'a str,
+    pub pins: &'a [&'a str],
+}
+
+/// WUU metadata errors identifying the rejected entry.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WuuMetadataError {
+    /// Signal name did not match the anchored `^IN([0-9]+)$` parser.
+    MalformedSignalName(String),
+    /// `IN<n>` entry carried no pin at all.
+    ZeroPinEntry(String),
+    /// `IN<n>` entry carried more than one pin.
+    MultiPinEntry(String),
+    /// Two entries resolved to the same WUU index.
+    DuplicateIndex(u8, String),
+    /// Two distinct indices claimed the same GPIO pin name.
+    DuplicatePinName(String),
+    /// Numeric suffix parsed but fell outside 0..=31.
+    IndexOutOfRange(String),
+    /// No peripheral named `WUU0` with `driver_name == "mcxa/WUU"`.
+    MissingWuu0,
+}
+
+/// Number of inputs in the WUU register file.
+const WUU_MAX_INPUTS: usize = 32;
